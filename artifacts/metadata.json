@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "created_at": "2026-07-10T08:51:01.741674+00:00",
+  "panel_start": "2007-01-01",
+  "panel_end": "2026-05-01",
+  "observation_count": 232,
+  "forecast_start": "2026-06-01",
+  "forecast_end": "2027-05-01",
+  "posterior_draws": 400,
+  "posterior_interval_quantiles": [
+    0.16,
+    0.84
+  ],
+  "source": "FRED API cache"
+}
