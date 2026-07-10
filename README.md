@@ -48,14 +48,17 @@ forecast.
 ## Conditional scenarios
 
 For every posterior parameter draw, the code constructs the joint Gaussian distribution of
-all five variables over all twelve future months. User-entered cells are exact linear
+all five variables over all twelve future months. User-entered cells become exact linear
 conditions on that 60-dimensional path. Standard Gaussian conditioning then updates every
 unconstrained variable and horizon. This matters: a CPI or policy-rate path affects the whole
 joint projection instead of merely replacing values after forecasting.
 
-The modal shows six actual months and twelve forecast months for every variable. Blank cells
-are unconstrained and their placeholders show baseline medians. Values are entered in the
-natural units shown beside each variable.
+The modal shows six actual months and twelve forecast months for every variable. Users choose
+Level, MoM, QoQ, YoY, or an annualized variant independently for each variable before entering
+values. Growth-series changes are percentages; rate-series changes are percentage points.
+When a change references another forecast month, the model conditions on the relationship
+between both months rather than filling in the lag from the baseline. Blank cells are
+unconstrained and their placeholders show baseline medians on the selected scale.
 
 ## Precompute, then run
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from us_bvar.config import SERIES_SPECS
 from us_bvar.model import BVAR
+from us_bvar.transforms import ScenarioConstraint
 
 
 def test_chart_bootstrap_renders_a_chart_inserted_as_the_mutation_root() -> None:
@@ -25,17 +26,43 @@ def test_chart_bootstrap_destroys_charts_removed_by_shiny() -> None:
 def test_scenario_modal_has_accessible_dialog_and_input_names(synthetic_levels) -> None:
     model = BVAR().fit(synthetic_levels)
     baseline = model.forecast(horizon=12, draws=20, seed=3)
-    scenario_modal = runpy.run_path(str(Path(__file__).parents[1] / "app.py"))["scenario_modal"]
+    app_module = runpy.run_path(str(Path(__file__).parents[1] / "app.py"))
+    scenario_modal = app_module["scenario_modal"]
+    scenario_variable_cells = app_module["scenario_variable_cells"]
 
     modal_html = str(scenario_modal(model, baseline, None))
 
     assert 'aria-label="Conditional scenario path"' in modal_html
     assert 'aria-modal="true"' in modal_html
     assert 'role="dialog"' in modal_html
-    assert modal_html.count('aria-label="') == 1 + 12 * len(SERIES_SPECS)
     for spec in SERIES_SPECS:
-        expected_name = f"{spec.label}, {baseline.dates[0]:%B %Y}, {spec.units}"
-        assert f'aria-label="{expected_name}"' in modal_html
+        assert f'id="sc_transform_{spec.series_id}"' in modal_html
+        assert f'id="scenario_cells_{spec.series_id}"' in modal_html
+
+    existing = model.forecast(
+        horizon=12,
+        draws=20,
+        constraints={(0, "INDPRO"): ScenarioConstraint(1.25, "qoq")},
+        seed=5,
+    )
+    existing_html = str(scenario_modal(model, baseline, existing))
+    assert '<option value="qoq" selected="">QoQ</option>' in existing_html
+
+    spec = SERIES_SPECS[0]
+    cells_html = str(
+        scenario_variable_cells(
+            model,
+            baseline,
+            {(0, spec.series_id): ScenarioConstraint(1.25, "qoq")},
+            spec,
+            "qoq",
+        )
+    )
+    assert cells_html.count('aria-label="') == 12
+    assert "Values in Percent change" in cells_html
+    assert 'value="1.25"' in cells_html
+    expected_name = f"{SERIES_SPECS[0].label}, {baseline.dates[0]:%B %Y}, Percent change"
+    assert f'aria-label="{expected_name}"' in cells_html
 
 
 def test_highcharts_is_served_from_local_static_assets() -> None:

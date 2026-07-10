@@ -1,11 +1,86 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from us_bvar.config import SeriesSpec
+
+PlotTransformation = Literal[
+    "level",
+    "mom",
+    "qoq",
+    "yoy",
+    "mom_annualized",
+    "qoq_annualized",
+    "yoy_annualized",
+]
+
+
+@dataclass(frozen=True)
+class TransformationSpec:
+    label: str
+    periods: int
+    annualization_factor: float
+    annualized: bool = False
+
+
+PLOT_TRANSFORMATIONS: dict[PlotTransformation, TransformationSpec] = {
+    "level": TransformationSpec("Level", periods=0, annualization_factor=1.0),
+    "mom": TransformationSpec("MoM", periods=1, annualization_factor=1.0),
+    "qoq": TransformationSpec("QoQ", periods=3, annualization_factor=1.0),
+    "yoy": TransformationSpec("YoY", periods=12, annualization_factor=1.0),
+    "mom_annualized": TransformationSpec(
+        "MoM · annualized", periods=1, annualization_factor=12.0, annualized=True
+    ),
+    "qoq_annualized": TransformationSpec(
+        "QoQ · annualized", periods=3, annualization_factor=4.0, annualized=True
+    ),
+    "yoy_annualized": TransformationSpec(
+        "YoY · annualized", periods=12, annualization_factor=1.0, annualized=True
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ScenarioConstraint:
+    """One user-entered scenario value and the scale on which it was entered."""
+
+    value: float
+    transformation: PlotTransformation = "level"
+
+
+def transformation_spec(transformation: PlotTransformation) -> TransformationSpec:
+    try:
+        return PLOT_TRANSFORMATIONS[transformation]
+    except KeyError as exc:
+        raise ValueError(f"Unknown transformation: {transformation}") from exc
+
+
+def transform_path(
+    values: pd.Series,
+    series_spec: SeriesSpec,
+    transformation: PlotTransformation,
+) -> pd.Series:
+    """Convert a natural-unit path to one of the dashboard display scales."""
+
+    spec = transformation_spec(transformation)
+    if transformation == "level":
+        return values.astype(float)
+
+    lagged = values.shift(spec.periods)
+    if series_spec.transform == "log":
+        ratio = values / lagged
+        if spec.annualized:
+            return (ratio.pow(spec.annualization_factor) - 1.0) * 100.0
+        return (ratio - 1.0) * 100.0
+
+    change = values - lagged
+    if spec.annualized:
+        change *= spec.annualization_factor
+    return change
 
 
 @dataclass(frozen=True)

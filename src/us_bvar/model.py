@@ -9,7 +9,12 @@ from scipy.linalg import cho_factor, cho_solve
 from scipy.stats import invwishart
 
 from us_bvar.config import PANDEMIC_CONTROL_MONTHS, SERIES_SPECS, SeriesSpec
-from us_bvar.transforms import LevelTransformer
+from us_bvar.transforms import (
+    PLOT_TRANSFORMATIONS,
+    LevelTransformer,
+    ScenarioConstraint,
+    transformation_spec,
+)
 
 
 @dataclass(frozen=True)
@@ -28,7 +33,7 @@ class ForecastResult:
     median: pd.DataFrame
     lower: pd.DataFrame
     upper: pd.DataFrame
-    constraints: Mapping[tuple[int, str], float]
+    constraints: Mapping[tuple[int, str], ScenarioConstraint]
     draws: int
 
     @property
@@ -118,7 +123,7 @@ class BVAR:
         self,
         horizon: int = 12,
         draws: int = 500,
-        constraints: Mapping[tuple[int, str], float] | None = None,
+        constraints: Mapping[tuple[int, str], float | ScenarioConstraint] | None = None,
         seed: int = 202503,
     ) -> ForecastResult:
         self._require_fit()
@@ -126,20 +131,16 @@ class BVAR:
             raise ValueError(
                 "Forecast horizon must be positive and at least 20 draws are required."
             )
-        constraints = dict(constraints or {})
-        encoded_constraints = self._encode_constraints(constraints, horizon)
-        constraint_indices = np.array(sorted(encoded_constraints), dtype=int)
-        targets = np.array([encoded_constraints[i] for i in constraint_indices])
+        normalized_constraints = self._normalize_constraints(constraints or {})
+        constraint_matrix, targets = self._constraint_system(normalized_constraints, horizon)
 
         rng = np.random.default_rng(seed)
         simulations = np.empty((draws, horizon, len(self.variable_ids)))
         for draw in range(draws):
             coefficients, sigma = self._draw_parameters(rng)
             mean, covariance = self._joint_forecast_moments(coefficients, sigma, horizon)
-            if len(constraint_indices):
-                sample = self._conditional_sample(
-                    rng, mean, covariance, constraint_indices, targets
-                )
+            if len(targets):
+                sample = self._conditional_sample(rng, mean, covariance, constraint_matrix, targets)
             else:
                 sample = self._sample_gaussian(rng, mean, covariance)
             simulations[draw] = sample.reshape(horizon, len(self.variable_ids))
@@ -161,7 +162,7 @@ class BVAR:
             median=frame(np.median(natural_draws, axis=0)),
             lower=frame(np.quantile(natural_draws, lower_q, axis=0)),
             upper=frame(np.quantile(natural_draws, upper_q, axis=0)),
-            constraints=constraints,
+            constraints=normalized_constraints,
             draws=draws,
         )
 
@@ -243,22 +244,79 @@ class BVAR:
         covariance = response_matrix @ innovation_covariance @ response_matrix.T
         return means.reshape(-1), (covariance + covariance.T) / 2
 
-    def _encode_constraints(
-        self, constraints: Mapping[tuple[int, str], float], horizon: int
-    ) -> dict[int, float]:
+    @staticmethod
+    def _normalize_constraints(
+        constraints: Mapping[tuple[int, str], float | ScenarioConstraint],
+    ) -> dict[tuple[int, str], ScenarioConstraint]:
+        result: dict[tuple[int, str], ScenarioConstraint] = {}
+        for key, raw_constraint in constraints.items():
+            constraint = (
+                raw_constraint
+                if isinstance(raw_constraint, ScenarioConstraint)
+                else ScenarioConstraint(value=float(raw_constraint))
+            )
+            if constraint.transformation not in PLOT_TRANSFORMATIONS:
+                raise ValueError(f"Unknown scenario transformation: {constraint.transformation}")
+            value = float(constraint.value)
+            if not np.isfinite(value):
+                raise ValueError("Scenario values must be finite numbers.")
+            result[key] = ScenarioConstraint(value=value, transformation=constraint.transformation)
+        return result
+
+    def _constraint_system(
+        self,
+        constraints: Mapping[tuple[int, str], ScenarioConstraint],
+        horizon: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
         assert self.transformer is not None
+        assert self.history_model is not None
         n = len(self.variable_ids)
-        result: dict[int, float] = {}
-        for (step, variable_id), value in constraints.items():
+        rows: list[np.ndarray] = []
+        targets: list[float] = []
+        for (step, variable_id), constraint in constraints.items():
             if not 0 <= step < horizon:
                 raise ValueError(f"Scenario step {step} is outside the forecast horizon.")
             if variable_id not in self.variable_ids:
                 raise ValueError(f"Unknown scenario variable: {variable_id}")
             variable_index = self.variable_ids.index(variable_id)
-            result[step * n + variable_index] = self.transformer.encode_value(
-                variable_index, float(value)
-            )
-        return result
+            row = np.zeros(horizon * n)
+            row[step * n + variable_index] = 1.0
+
+            if constraint.transformation == "level":
+                target = self.transformer.encode_value(variable_index, constraint.value)
+            else:
+                spec = self.specs[variable_index]
+                display_spec = transformation_spec(constraint.transformation)
+                if spec.transform == "log":
+                    if constraint.value <= -100.0:
+                        raise ValueError(
+                            f"{spec.short_label} growth must be greater than -100 percent."
+                        )
+                    latent_change = np.log1p(constraint.value / 100.0)
+                else:
+                    latent_change = constraint.value
+                if display_spec.annualized:
+                    latent_change /= display_spec.annualization_factor
+                model_change = latent_change / self.transformer.scales[variable_index]
+                lag_step = step - display_spec.periods
+                if lag_step >= 0:
+                    row[lag_step * n + variable_index] = -1.0
+                    target = model_change
+                else:
+                    if abs(lag_step) > len(self.history_model):
+                        raise ValueError(
+                            f"Not enough history to apply {display_spec.label} to "
+                            f"{spec.short_label}."
+                        )
+                    target = float(self.history_model.iloc[lag_step, variable_index]) + model_change
+
+            rows.append(row)
+            targets.append(float(target))
+
+        return (
+            np.vstack(rows) if rows else np.empty((0, horizon * n)),
+            np.asarray(targets, dtype=float),
+        )
 
     @classmethod
     def _conditional_sample(
@@ -266,29 +324,25 @@ class BVAR:
         rng: np.random.Generator,
         mean: np.ndarray,
         covariance: np.ndarray,
-        constrained: np.ndarray,
+        constraint_matrix: np.ndarray,
         targets: np.ndarray,
     ) -> np.ndarray:
-        sigma_cc = covariance[np.ix_(constrained, constrained)]
-        unconstrained = np.setdiff1d(np.arange(mean.size), constrained, assume_unique=True)
-        sample = np.empty_like(mean)
-        sample[constrained] = targets
-        if not len(unconstrained):
-            rng.standard_normal(mean.size)
-            return sample
+        sample = cls._sample_gaussian(rng, mean, covariance)
+        cross_covariance = covariance @ constraint_matrix.T
+        conditioned_system = constraint_matrix @ cross_covariance
+        try:
+            adjustment = np.linalg.solve(conditioned_system, targets - constraint_matrix @ sample)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
+        result = sample + cross_covariance @ adjustment
 
-        sigma_uc = covariance[np.ix_(unconstrained, constrained)]
-        conditioned_system = sigma_cc + np.eye(len(constrained)) * 1e-10
-        adjustment = np.linalg.solve(conditioned_system, targets - mean[constrained])
-        conditional_mean = mean[unconstrained] + sigma_uc @ adjustment
-        conditional_covariance = covariance[np.ix_(unconstrained, unconstrained)] - (
-            sigma_uc @ np.linalg.solve(conditioned_system, sigma_uc.T)
-        )
-        sample[unconstrained] = cls._sample_gaussian(rng, conditional_mean, conditional_covariance)
-        # Keep later posterior parameter draws aligned across scenarios with
-        # different numbers of constraints.
-        rng.standard_normal(len(constrained))
-        return sample
+        # Remove the last few floating-point bits of residual so exact constraints
+        # remain exact after conversion back to natural units.
+        residual = targets - constraint_matrix @ result
+        if np.any(np.abs(residual) > 1e-12):
+            correction_system = constraint_matrix @ constraint_matrix.T
+            result += constraint_matrix.T @ np.linalg.solve(correction_system, residual)
+        return result
 
     @staticmethod
     def _sample_gaussian(

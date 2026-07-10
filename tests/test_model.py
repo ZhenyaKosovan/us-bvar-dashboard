@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
+import pytest
 
+from us_bvar.config import SERIES_BY_ID
 from us_bvar.model import BVAR
+from us_bvar.transforms import ScenarioConstraint, transform_path
 
 
 def test_baseline_forecast_has_expected_shape_and_is_reproducible(synthetic_levels) -> None:
@@ -42,6 +46,73 @@ def test_invalid_log_constraint_is_rejected(synthetic_levels) -> None:
         assert "greater than zero" in str(exc)
     else:
         raise AssertionError("Expected a non-positive logged scenario value to fail")
+
+
+@pytest.mark.parametrize(
+    ("transformation", "step"),
+    [
+        ("mom", 5),
+        ("qoq", 5),
+        ("yoy", 11),
+        ("mom_annualized", 5),
+        ("qoq_annualized", 5),
+        ("yoy_annualized", 11),
+    ],
+)
+@pytest.mark.parametrize(
+    ("series_id", "target"),
+    [("CPIAUCSL", 2.4), ("UNRATE", 1.2)],
+)
+def test_conditional_forecast_hits_transformed_constraints(
+    synthetic_levels,
+    transformation: str,
+    step: int,
+    series_id: str,
+    target: float,
+) -> None:
+    model = BVAR().fit(synthetic_levels)
+    constraint = ScenarioConstraint(target, transformation)
+    scenario = model.forecast(
+        horizon=12,
+        draws=20,
+        constraints={(step, series_id): constraint},
+        seed=13,
+    )
+    path = pd.concat([synthetic_levels[series_id], scenario.median[series_id]])
+    transformed = transform_path(path, SERIES_BY_ID[series_id], transformation)
+
+    assert transformed.loc[scenario.dates[step]] == pytest.approx(target)
+    assert scenario.constraints[(step, series_id)] == constraint
+
+
+def test_log_growth_constraint_rejects_a_total_loss(synthetic_levels) -> None:
+    model = BVAR().fit(synthetic_levels)
+
+    with pytest.raises(ValueError, match="greater than -100 percent"):
+        model.forecast(
+            horizon=3,
+            draws=20,
+            constraints={(0, "CPIAUCSL"): ScenarioConstraint(-100.0, "mom")},
+        )
+
+
+def test_multiple_growth_constraints_form_an_exact_forecast_path(synthetic_levels) -> None:
+    model = BVAR().fit(synthetic_levels)
+    targets = {0: 0.2, 1: 0.3, 4: -0.1, 8: 0.4}
+    scenario = model.forecast(
+        horizon=12,
+        draws=20,
+        constraints={
+            (step, "CPIAUCSL"): ScenarioConstraint(target, "mom")
+            for step, target in targets.items()
+        },
+        seed=17,
+    )
+    path = pd.concat([synthetic_levels["CPIAUCSL"], scenario.median["CPIAUCSL"]])
+    transformed = transform_path(path, SERIES_BY_ID["CPIAUCSL"], "mom")
+
+    for step, target in targets.items():
+        assert transformed.loc[scenario.dates[step]] == pytest.approx(target)
 
 
 def test_joint_forecast_covariance_matches_direct_block_calculation(synthetic_levels) -> None:

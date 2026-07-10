@@ -4,16 +4,22 @@ import asyncio
 import json
 from pathlib import Path
 
+import pandas as pd
 from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 
 from us_bvar.artifact import load_artifact
-from us_bvar.config import SERIES_SPECS
+from us_bvar.config import SERIES_SPECS, SeriesSpec
 from us_bvar.model import BVAR, ForecastResult
 from us_bvar.presentation import (
-    PLOT_TRANSFORMATIONS,
-    PlotTransformation,
     forecast_gt,
     highcharts_options,
+    plot_units,
+)
+from us_bvar.transforms import (
+    PLOT_TRANSFORMATIONS,
+    PlotTransformation,
+    ScenarioConstraint,
+    transform_path,
 )
 
 ROOT = Path(__file__).parent
@@ -139,53 +145,39 @@ def scenario_modal(
     baseline: ForecastResult,
     existing: ForecastResult | None,
 ) -> ui.Tag:
-    assert model.history_levels is not None
-    recent = model.history_levels.tail(6)
     existing_constraints = dict(existing.constraints) if existing else {}
     variable_sections: list[ui.Tag] = []
     for spec in SERIES_SPECS:
-        cells: list[ui.Tag] = []
-        for date, value in recent[spec.series_id].items():
-            cells.append(
-                ui.div(
-                    ui.span(date.strftime("%b %y"), class_="scenario-date"),
-                    ui.span(f"{value:,.{spec.decimals}f}", class_="history-value"),
-                    class_="scenario-cell historical-cell",
-                )
-            )
-        for step, date in enumerate(baseline.dates):
-            constraint = existing_constraints.get((step, spec.series_id))
-            scenario_input = ui.input_text(
-                f"sc_{spec.series_id}_{step}",
-                None,
-                value="" if constraint is None else str(constraint),
-                placeholder=f"{baseline.median.loc[date, spec.series_id]:.{spec.decimals}f}",
-            )
-            scenario_input.children[1].attrs["aria-label"] = (
-                f"{spec.label}, {date:%B %Y}, {spec.units}"
-            )
-            cells.append(
-                ui.div(
-                    ui.span(date.strftime("%b %y"), class_="scenario-date"),
-                    scenario_input,
-                    class_="scenario-cell forecast-cell",
-                )
-            )
+        selected: PlotTransformation = "level"
+        for (_step, variable_id), constraint in existing_constraints.items():
+            if variable_id == spec.series_id:
+                selected = constraint.transformation
+                break
         variable_sections.append(
             ui.div(
                 ui.div(
                     ui.h4(spec.label),
-                    ui.span(spec.units),
+                    ui.input_select(
+                        f"sc_transform_{spec.series_id}",
+                        "Input transformation",
+                        choices={
+                            key: transform_spec.label
+                            for key, transform_spec in PLOT_TRANSFORMATIONS.items()
+                        },
+                        selected=selected,
+                        width="190px",
+                    ),
                     class_="scenario-variable-title",
                 ),
-                ui.div(*cells, class_="scenario-strip"),
+                ui.output_ui(f"scenario_cells_{spec.series_id}"),
                 class_="scenario-variable",
             )
         )
     modal = ui.modal(
         ui.p(
-            "Enter natural-unit values in any forecast cells. Blank cells remain "
-            "unconstrained; placeholders show the baseline median.",
+            "Choose an input transformation independently for each variable, then enter "
+            "values in any forecast cells. Blank cells remain unconstrained; placeholders "
+            "show the baseline on the selected scale.",
             class_="modal-instructions",
         ),
         *variable_sections,
@@ -208,17 +200,71 @@ def scenario_modal(
     return modal
 
 
+def scenario_variable_cells(
+    model: BVAR,
+    baseline: ForecastResult,
+    existing_constraints: dict[tuple[int, str], ScenarioConstraint],
+    spec: SeriesSpec,
+    transformation: PlotTransformation,
+) -> ui.Tag:
+    """Render one scenario-input strip on the selected display scale."""
+
+    assert model.history_levels is not None
+    history = model.history_levels[spec.series_id].astype(float)
+    baseline_path = pd.concat([history, baseline.median[spec.series_id]]).astype(float)
+    transformed_history = transform_path(history, spec, transformation)
+    transformed_baseline = transform_path(baseline_path, spec, transformation)
+    decimals = spec.decimals if transformation == "level" else 2
+    units = plot_units(spec, transformation)
+
+    cells: list[ui.Tag] = []
+    for date, value in transformed_history.tail(6).items():
+        cells.append(
+            ui.div(
+                ui.span(date.strftime("%b %y"), class_="scenario-date"),
+                ui.span(f"{value:,.{decimals}f}", class_="history-value"),
+                class_="scenario-cell historical-cell",
+            )
+        )
+    for step, date in enumerate(baseline.dates):
+        constraint = existing_constraints.get((step, spec.series_id))
+        value = ""
+        if constraint is not None and constraint.transformation == transformation:
+            value = str(constraint.value)
+        scenario_input = ui.input_text(
+            f"sc_{spec.series_id}_{step}",
+            None,
+            value=value,
+            placeholder=f"{transformed_baseline.loc[date]:.{decimals}f}",
+        )
+        scenario_input.children[1].attrs["aria-label"] = f"{spec.label}, {date:%B %Y}, {units}"
+        cells.append(
+            ui.div(
+                ui.span(date.strftime("%b %y"), class_="scenario-date"),
+                scenario_input,
+                class_="scenario-cell forecast-cell",
+            )
+        )
+    return ui.div(
+        ui.div(f"Values in {units}", class_="scenario-input-units"),
+        ui.div(*cells, class_="scenario-strip"),
+    )
+
+
 def server(input: Inputs, output: Outputs, session: Session) -> None:
     model_state: reactive.Value[BVAR | None] = reactive.Value(None)
     baseline_state: reactive.Value[ForecastResult | None] = reactive.Value(None)
     scenario_state: reactive.Value[ForecastResult | None] = reactive.Value(None)
+    scenario_editor_state: reactive.Value[dict[tuple[int, str], ScenarioConstraint]] = (
+        reactive.Value({})
+    )
     status_state = reactive.Value("Loading the precomputed forecast …")
     artifact_header_state = reactive.Value("Forecast artifact")
     initial_attempted = reactive.Value(False)
 
     @reactive.extended_task
     async def _scenario_task(
-        model: BVAR, constraints: dict[tuple[int, str], float]
+        model: BVAR, constraints: dict[tuple[int, str], ScenarioConstraint]
     ) -> ForecastResult:
         return await asyncio.to_thread(
             model.forecast,
@@ -350,6 +396,29 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
     for chart_spec in SERIES_SPECS:
         _register_chart(chart_spec)
 
+    def _register_scenario_cells(series_spec: SeriesSpec) -> None:
+        @output(id=f"scenario_cells_{series_spec.series_id}", suspend_when_hidden=False)
+        @render.ui
+        def _scenario_cells() -> ui.Tag:
+            model = model_state.get()
+            baseline = baseline_state.get()
+            if model is None or baseline is None:
+                return ui.div()
+            raw_transformation = input[f"sc_transform_{series_spec.series_id}"]()
+            transformation: PlotTransformation = (
+                raw_transformation if raw_transformation in PLOT_TRANSFORMATIONS else "level"
+            )
+            return scenario_variable_cells(
+                model,
+                baseline,
+                scenario_editor_state.get(),
+                series_spec,
+                transformation,
+            )
+
+    for series_spec in SERIES_SPECS:
+        _register_scenario_cells(series_spec)
+
     @output
     @render.ui
     def forecast_table() -> ui.Tag:
@@ -367,7 +436,9 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         baseline = baseline_state.get()
         if model is None or baseline is None:
             return
-        ui.modal_show(scenario_modal(model, baseline, scenario_state.get()))
+        existing = scenario_state.get()
+        scenario_editor_state.set(dict(existing.constraints) if existing else {})
+        ui.modal_show(scenario_modal(model, baseline, existing))
 
     @reactive.effect
     @reactive.event(input.run_scenario)
@@ -375,13 +446,20 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         model = model_state.get()
         if model is None or baseline_state.get() is None:
             return
-        constraints: dict[tuple[int, str], float] = {}
+        constraints: dict[tuple[int, str], ScenarioConstraint] = {}
         try:
             for spec in SERIES_SPECS:
+                raw_transformation = input[f"sc_transform_{spec.series_id}"]()
+                transformation: PlotTransformation = (
+                    raw_transformation if raw_transformation in PLOT_TRANSFORMATIONS else "level"
+                )
                 for step in range(FORECAST_HORIZON):
                     raw = input[f"sc_{spec.series_id}_{step}"]()
                     if raw is not None and str(raw).strip():
-                        constraints[(step, spec.series_id)] = float(str(raw).replace(",", ""))
+                        constraints[(step, spec.series_id)] = ScenarioConstraint(
+                            value=float(str(raw).replace(",", "")),
+                            transformation=transformation,
+                        )
             if not constraints:
                 raise ValueError("Enter at least one scenario value.")
             ui.modal_remove()
@@ -416,6 +494,7 @@ def server(input: Inputs, output: Outputs, session: Session) -> None:
         baseline = baseline_state.get()
         if model is None or baseline is None:
             return
+        scenario_editor_state.set({})
         ui.modal_remove()
         ui.modal_show(scenario_modal(model, baseline, None))
 

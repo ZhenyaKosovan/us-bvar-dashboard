@@ -507,8 +507,9 @@ body {
 }
 
 .scenario-variable-title {
-  align-items: baseline;
+  align-items: center;
   display: flex;
+  justify-content: space-between;
   gap: 0.65rem;
 }
 
@@ -520,10 +521,19 @@ body {
   margin: 0 0 0.65rem;
 }
 
-.scenario-variable-title span {
+.scenario-variable-title .form-group {
+  margin: 0 0 0.65rem;
+}
+
+.scenario-variable-title label,
+.scenario-input-units {
   color: var(--muted);
   font-size: 0.66rem;
   font-weight: 700;
+}
+
+.scenario-input-units {
+  margin-bottom: 0.45rem;
 }
 
 .scenario-strip {
