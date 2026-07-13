@@ -10,42 +10,33 @@ from us_bvar.config import SeriesSpec
 from us_bvar.model import ForecastResult
 from us_bvar.transforms import (
     PlotTransformation,
+    transform_forecast_samples,
     transform_path,
     transformation_spec,
 )
 
 
-def _transformed_interval(
+def forecast_summary_on_scale(
     history: pd.Series,
-    baseline: ForecastResult,
+    forecast: ForecastResult,
     series_spec: SeriesSpec,
     transformation: PlotTransformation,
-) -> tuple[pd.Series, pd.Series]:
-    series_id = series_spec.series_id
-    lower_path = pd.concat([history, baseline.lower[series_id]]).astype(float)
-    upper_path = pd.concat([history, baseline.upper[series_id]]).astype(float)
-    if transformation == "level":
-        return lower_path.loc[baseline.dates], upper_path.loc[baseline.dates]
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Return forecast quantiles after transforming complete posterior paths."""
 
-    transform_spec = transformation_spec(transformation)
-    lower_lag = lower_path.shift(transform_spec.periods)
-    upper_lag = upper_path.shift(transform_spec.periods)
-    if series_spec.transform == "log":
-        lower_ratio = lower_path / upper_lag
-        upper_ratio = upper_path / lower_lag
-        if transform_spec.annualized:
-            lower_values = (lower_ratio.pow(transform_spec.annualization_factor) - 1.0) * 100.0
-            upper_values = (upper_ratio.pow(transform_spec.annualization_factor) - 1.0) * 100.0
-        else:
-            lower_values = (lower_ratio - 1.0) * 100.0
-            upper_values = (upper_ratio - 1.0) * 100.0
-    else:
-        lower_values = lower_path - upper_lag
-        upper_values = upper_path - lower_lag
-        if transform_spec.annualized:
-            lower_values *= transform_spec.annualization_factor
-            upper_values *= transform_spec.annualization_factor
-    return lower_values.loc[baseline.dates], upper_values.loc[baseline.dates]
+    series_index = forecast.median.columns.get_loc(series_spec.series_id)
+    transformed = transform_forecast_samples(
+        history,
+        forecast.samples[:, :, series_index],
+        series_spec,
+        transformation,
+    )
+    lower_q, upper_q = forecast.interval
+
+    def quantile(probability: float) -> pd.Series:
+        return pd.Series(np.quantile(transformed, probability, axis=0), index=forecast.dates)
+
+    return quantile(0.5), quantile(lower_q), quantile(upper_q)
 
 
 def plot_units(series_spec: SeriesSpec, transformation: PlotTransformation) -> str:
@@ -70,7 +61,7 @@ def forecast_display_frame(
     scenario: ForecastResult | None = None,
     history_months: int = 6,
 ) -> pd.DataFrame:
-    """Build the exact 6-history + 12-forecast rows shown in the dashboard."""
+    """Build the exact history and forecast rows shown in the dashboard."""
 
     recent = history.tail(history_months)
     dates = recent.index.append(baseline.dates)
@@ -208,24 +199,24 @@ def forecast_gt(
             columns=columns,
             id=spec.series_id,
         )
-    table = table.cols_width({column: "178px" for column in value_columns})
-    return table
+    return table.cols_width({column: "178px" for column in value_columns})
 
 
-def highcharts_options(
+def echarts_options(
     history: pd.DataFrame,
     baseline: ForecastResult,
     spec: SeriesSpec,
     scenario: ForecastResult | None = None,
     transformation: PlotTransformation = "level",
 ) -> dict[str, Any]:
-    series_id = spec.series_id
-    history_series = history[series_id].astype(float)
-    baseline_path = pd.concat([history_series, baseline.median[series_id]]).astype(float)
+    """Build a local Apache ECharts configuration for one model variable."""
+
+    history_series = history[spec.series_id].astype(float)
     transformed_history = transform_path(history_series, spec, transformation)
-    transformed_baseline = transform_path(baseline_path, spec, transformation)
     recent = transformed_history.tail(6)
-    lower, upper = _transformed_interval(history_series, baseline, spec, transformation)
+    baseline_median, lower, upper = forecast_summary_on_scale(
+        history_series, baseline, spec, transformation
+    )
     units = plot_units(spec, transformation)
 
     def point(date: pd.Timestamp, value: float) -> list[float]:
@@ -234,107 +225,111 @@ def highcharts_options(
     historical = [point(date, value) for date, value in recent.items()]
     last_point = point(recent.index[-1], recent.iloc[-1])
     baseline_line = [last_point] + [
-        point(date, transformed_baseline.loc[date]) for date in baseline.dates
+        point(date, baseline_median.loc[date]) for date in baseline.dates
     ]
     interval = [
-        [
-            float(pd.Timestamp(recent.index[-1]).timestamp() * 1000),
-            round(float(recent.iloc[-1]), 6),
-            round(float(recent.iloc[-1]), 6),
-        ]
-    ] + [
-        [
-            float(pd.Timestamp(date).timestamp() * 1000),
-            round(float(lower.loc[date]), 6),
-            round(float(upper.loc[date]), 6),
-        ]
-        for date in baseline.dates
+        [last_point[0], last_point[1], last_point[1]],
+        *[
+            [
+                float(pd.Timestamp(date).timestamp() * 1000),
+                round(float(lower.loc[date]), 6),
+                round(float(upper.loc[date]), 6),
+            ]
+            for date in baseline.dates
+        ],
     ]
     series: list[dict[str, Any]] = [
         {
             "name": "Historical",
             "type": "line",
             "data": historical,
-            "color": "#f6f6f6",
-            "lineWidth": 2.5,
-            "marker": {"enabled": True, "radius": 2.5},
-            "zIndex": 4,
-        },
-        {
-            "name": "Baseline 16th–84th percentile interval",
-            "type": "arearange",
-            "data": interval,
-            "color": "#4fcdb0",
-            "fillOpacity": 0.16,
-            "lineWidth": 0,
-            "marker": {"enabled": False},
-            "zIndex": 1,
+            "showSymbol": True,
+            "symbolSize": 5,
+            "lineStyle": {"color": "#e9eef5", "width": 2.5},
+            "itemStyle": {"color": "#e9eef5"},
+            "z": 4,
         },
         {
             "name": "Baseline",
             "type": "line",
             "data": baseline_line,
-            "color": "#4fcdb0",
-            "dashStyle": "ShortDash",
-            "lineWidth": 2.5,
-            "marker": {"enabled": False},
-            "zIndex": 3,
+            "showSymbol": False,
+            "lineStyle": {"color": "#36d6bd", "type": "dashed", "width": 2.5},
+            "itemStyle": {"color": "#36d6bd"},
+            "z": 3,
         },
     ]
+    bands = [
+        {
+            "name": "Baseline 16th–84th percentile interval",
+            "data": interval,
+            "color": "rgba(54, 214, 189, 0.16)",
+        }
+    ]
     if scenario is not None:
-        scenario_path = pd.concat([history_series, scenario.median[series_id]]).astype(float)
-        transformed_scenario = transform_path(scenario_path, spec, transformation)
+        scenario_median, scenario_lower, scenario_upper = forecast_summary_on_scale(
+            history_series, scenario, spec, transformation
+        )
         scenario_line = [last_point] + [
-            point(date, transformed_scenario.loc[date]) for date in scenario.dates
+            point(date, scenario_median.loc[date]) for date in scenario.dates
         ]
+        bands.append(
+            {
+                "name": "Scenario 16th–84th percentile interval",
+                "data": [
+                    [last_point[0], last_point[1], last_point[1]],
+                    *[
+                        [
+                            float(pd.Timestamp(date).timestamp() * 1000),
+                            round(float(scenario_lower.loc[date]), 6),
+                            round(float(scenario_upper.loc[date]), 6),
+                        ]
+                        for date in scenario.dates
+                    ],
+                ],
+                "color": "rgba(255, 143, 92, 0.12)",
+            }
+        )
         series.append(
             {
                 "name": "Scenario",
                 "type": "line",
                 "data": scenario_line,
-                "color": "#ff7a45",
-                "lineWidth": 3,
-                "marker": {"enabled": False},
-                "zIndex": 5,
+                "showSymbol": False,
+                "lineStyle": {"color": "#ff8f5c", "width": 3},
+                "itemStyle": {"color": "#ff8f5c"},
+                "z": 5,
             }
         )
 
     return {
-        "chart": {
-            "backgroundColor": "transparent",
-            "height": 310,
-            "spacing": [8, 8, 8, 8],
-            "style": {"fontFamily": "Inter, system-ui, sans-serif"},
-        },
-        "title": {"text": None},
-        "credits": {"enabled": False},
-        "legend": {
-            "align": "left",
-            "verticalAlign": "top",
-            "itemStyle": {"color": "#bfb29e", "fontSize": "11px", "fontWeight": "600"},
-        },
+        "animation": False,
+        "backgroundColor": "transparent",
+        "aria": {"enabled": True, "description": f"{spec.label} history and forecast chart."},
+        "grid": {"left": 62, "right": 22, "top": 54, "bottom": 42},
+        "legend": {"top": 4, "left": 4, "textStyle": {"color": "#9eacbd", "fontSize": 11}},
+        "bvarBands": bands,
+        "bvarValueDecimals": spec.decimals if transformation == "level" else 2,
+        "bvarUnits": units,
         "xAxis": {
-            "type": "datetime",
-            "labels": {"style": {"color": "#bfb29e"}},
-            "lineColor": "rgba(191, 178, 158, 0.5)",
-            "tickColor": "rgba(191, 178, 158, 0.5)",
+            "type": "time",
+            "axisLabel": {"color": "#9eacbd", "hideOverlap": True},
+            "axisLine": {"lineStyle": {"color": "rgba(158, 172, 189, 0.34)"}},
+            "axisTick": {"show": False},
+            "splitLine": {"show": False},
         },
         "yAxis": {
-            "labels": {"style": {"color": "#bfb29e"}},
-            "title": {
-                "text": units,
-                "style": {"color": "#bfb29e", "fontSize": "10px"},
-            },
-            "gridLineColor": "rgba(191, 178, 158, 0.18)",
+            "type": "value",
+            "name": units,
+            "nameLocation": "middle",
+            "nameGap": 46,
+            "nameTextStyle": {"color": "#9eacbd", "fontSize": 10},
+            "axisLabel": {"color": "#9eacbd"},
+            "axisLine": {"show": False},
+            "axisTick": {"show": False},
+            "splitLine": {"lineStyle": {"color": "rgba(158, 172, 189, 0.13)"}},
+            "scale": True,
         },
-        "tooltip": {
-            "backgroundColor": "#141413",
-            "borderColor": "rgba(191, 178, 158, 0.5)",
-            "shared": True,
-            "style": {"color": "#f6f6f6"},
-            "xDateFormat": "%B %Y",
-            "valueDecimals": spec.decimals if transformation == "level" else 2,
-        },
-        "plotOptions": {"series": {"animation": False}},
+        "tooltip": {"trigger": "axis", "confine": True, "backgroundColor": "#0b1220"},
         "series": series,
     }

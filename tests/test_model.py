@@ -15,6 +15,8 @@ def test_baseline_forecast_has_expected_shape_and_is_reproducible(synthetic_leve
     second = model.forecast(horizon=12, draws=24, seed=7)
 
     assert first.median.shape == (12, 5)
+    assert first.samples.shape == (24, 12, 5)
+    assert not first.samples.flags.writeable
     assert first.dates[0] > synthetic_levels.index[-1]
     assert np.allclose(first.median, second.median)
     assert (first.lower.to_numpy() <= first.upper.to_numpy()).all()

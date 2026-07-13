@@ -33,8 +33,10 @@ class ForecastResult:
     median: pd.DataFrame
     lower: pd.DataFrame
     upper: pd.DataFrame
+    samples: np.ndarray
     constraints: Mapping[tuple[int, str], ScenarioConstraint]
     draws: int
+    interval: tuple[float, float]
 
     @property
     def is_scenario(self) -> bool:
@@ -147,6 +149,11 @@ class BVAR:
 
         assert self.transformer is not None
         natural_draws = self.transformer.decode_array(simulations)
+        if not np.isfinite(natural_draws).all():
+            raise ValueError(
+                "The scenario produced non-finite forecast values. Use less extreme constraints."
+            )
+        natural_draws.setflags(write=False)
         lower_q, upper_q = self.config.interval
         dates = pd.date_range(
             pd.Timestamp(self.history_levels.index[-1]) + pd.offsets.MonthBegin(1),
@@ -162,8 +169,10 @@ class BVAR:
             median=frame(np.median(natural_draws, axis=0)),
             lower=frame(np.quantile(natural_draws, lower_q, axis=0)),
             upper=frame(np.quantile(natural_draws, upper_q, axis=0)),
+            samples=natural_draws,
             constraints=normalized_constraints,
             draws=draws,
+            interval=self.config.interval,
         )
 
     def _design_matrix(self, model_frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -260,6 +269,8 @@ class BVAR:
             value = float(constraint.value)
             if not np.isfinite(value):
                 raise ValueError("Scenario values must be finite numbers.")
+            if abs(value) > 1_000_000_000:
+                raise ValueError("Scenario values must be no larger than 1 billion in magnitude.")
             result[key] = ScenarioConstraint(value=value, transformation=constraint.transformation)
         return result
 

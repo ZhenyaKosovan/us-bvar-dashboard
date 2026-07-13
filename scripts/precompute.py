@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from us_bvar.artifact import ForecastArtifact, save_artifact
+from us_bvar.artifact import ForecastArtifact, artifact_sha256, save_artifact
 from us_bvar.data import FREDClient
 from us_bvar.model import BVAR
 
@@ -29,6 +31,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.draws < 20:
+        raise SystemExit("--draws must be at least 20")
     load_dotenv(ROOT / ".env")
     client = FREDClient(
         api_key="" if args.offline else None,
@@ -53,7 +57,10 @@ def main() -> None:
         "forecast_end": artifact.baseline.dates[-1].date().isoformat(),
         "posterior_draws": artifact.baseline.draws,
         "posterior_interval_quantiles": list(model.config.interval),
+        "model_config": asdict(model.config),
         "source": "FRED API cache" if panel.from_cache else "FRED API",
+        "panel_sha256": sha256(panel_path.read_bytes()).hexdigest(),
+        "artifact_sha256": artifact_sha256(artifact_path),
     }
     (ROOT / "artifacts/metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

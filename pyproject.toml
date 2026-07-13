@@ -3,15 +3,16 @@ name = "us-bvar-dashboard"
 version = "0.1.0"
 description = "A monthly US Bayesian VAR dashboard with conditional scenario forecasts"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "great-tables>=0.17",
-    "httpx>=0.27",
-    "numpy>=2.0",
-    "pandas>=2.2",
-    "python-dotenv>=1.1",
-    "scipy>=1.14",
-    "shiny>=1.4",
+    "great-tables>=0.17,<1",
+    "httpx>=0.27,<1",
+    "numpy>=2.0,<3",
+    "pandas>=2.2,<4",
+    "python-dotenv>=1.1,<2",
+    "scipy>=1.14,<2",
+    "shiny>=1.4,<2",
+    "starlette>=0.49,<2",
 ]
 
 [dependency-groups]

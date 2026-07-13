@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,7 +52,7 @@ class FREDClient:
             if cached is not None:
                 return cached, True
             raise FREDDataError(
-                "A FRED API key is required. Set FRED_API_KEY or enter one in the dashboard."
+                "A FRED API key is required. Set FRED_API_KEY or run with a valid local cache."
             )
 
         params = {
@@ -115,15 +116,36 @@ class FREDClient:
 
     def _write_cache(self, series: pd.Series, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        series.rename("value").to_csv(path, index_label="date")
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                series.rename("value").to_csv(temporary, index_label="date")
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
 
     @staticmethod
     def _read_cache(path: Path, series_id: str) -> pd.Series | None:
         if not path.exists():
             return None
-        frame = pd.read_csv(path, parse_dates=["date"])
-        if "value" not in frame:
+        try:
+            frame = pd.read_csv(path)
+        except (OSError, pd.errors.ParserError, UnicodeError):
+            return None
+        if not {"date", "value"}.issubset(frame.columns):
             return None
         values = pd.to_numeric(frame["value"], errors="coerce")
-        index = pd.to_datetime(frame["date"]).dt.to_period("M").dt.to_timestamp()
-        return pd.Series(values.to_numpy(), index=index, name=series_id).dropna().sort_index()
+        index = pd.to_datetime(frame["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        series = pd.Series(values.to_numpy(), index=index, name=series_id).dropna().sort_index()
+        series = series.loc[series.index.notna()]
+        if series.empty:
+            return None
+        return series.groupby(level=0).last()

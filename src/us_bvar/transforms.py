@@ -83,6 +83,38 @@ def transform_path(
     return change
 
 
+def transform_forecast_samples(
+    history: pd.Series,
+    samples: np.ndarray,
+    series_spec: SeriesSpec,
+    transformation: PlotTransformation,
+) -> np.ndarray:
+    """Transform forecast draws while preserving their cross-horizon dependence."""
+
+    values = np.asarray(samples, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("Forecast samples must have shape (draws, horizon).")
+    if transformation == "level":
+        return values.copy()
+
+    spec = transformation_spec(transformation)
+    references = np.empty_like(values)
+    historical = history.to_numpy(dtype=float)
+    for step in range(values.shape[1]):
+        lag_step = step - spec.periods
+        references[:, step] = values[:, lag_step] if lag_step >= 0 else historical[lag_step]
+
+    if series_spec.transform == "log":
+        ratios = values / references
+        exponent = spec.annualization_factor if spec.annualized else 1.0
+        return (np.power(ratios, exponent) - 1.0) * 100.0
+
+    changes = values - references
+    if spec.annualized:
+        changes *= spec.annualization_factor
+    return changes
+
+
 @dataclass(frozen=True)
 class LevelTransformer:
     """Log selected levels and standardize every model variable."""
