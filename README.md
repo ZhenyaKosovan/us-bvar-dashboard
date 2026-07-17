@@ -85,12 +85,12 @@ application.
 ```mermaid
 flowchart LR
     subgraph Refresh[Offline or scheduled refresh]
-        FRED[FRED observations API]
+        FRED["FRED observations API"]
         Cache[(Per-series CSV cache)]
-        Precompute[scripts/precompute.py]
-        Stage[Complete versioned release]
-        Pointer[active.json pointer]
-        Panel[Panel + artifact + checksum + metadata]
+        Precompute["scripts/precompute.py"]
+        Stage["Complete versioned release"]
+        Pointer["active.json pointer"]
+        Panel["Panel + artifact + checksum + metadata"]
 
         FRED --> Precompute
         Cache <--> Precompute
@@ -100,15 +100,15 @@ flowchart LR
     end
 
     subgraph Runtime[Long-running Shiny process]
-        Loader[Artifact validation and load]
-        Model[Shared fitted BVAR and baseline]
-        Server[Per-session Shiny server]
-        Scenario[Conditional forecast worker]
-        Health[/healthz]
-        Logs[stdout JSON telemetry]
+        Loader["Artifact validation and load"]
+        Model["Shared fitted BVAR and baseline"]
+        Server["Per-session Shiny server"]
+        Scenario["Conditional forecast worker"]
+        Health["/healthz"]
+        Logs["stdout JSON telemetry"]
 
-        Artifact --> Loader
-        Digest --> Loader
+        Pointer --> Loader
+        Panel --> Loader
         Loader --> Model
         Model --> Server
         Server --> Scenario
