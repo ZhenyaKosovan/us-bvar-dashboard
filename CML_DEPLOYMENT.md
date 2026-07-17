@@ -1,6 +1,8 @@
+<!-- markdownlint-disable MD013 -->
+
 # Production readiness and CML deployment plan
 
-Last reviewed: 10 July 2026
+Last reviewed: 15 July 2026
 
 ## Executive decision
 
@@ -39,39 +41,29 @@ Separation of responsibilities:
 ## Findings and disposition
 
 | Severity | Finding in the original code | Resolution |
-|---|---|---|
+| --- | --- | --- |
 | Blocking | No CML launcher or `CDSW_APP_PORT` contract | Added `cml_entry.py`; binds `127.0.0.1`, validates the port, uses production mode, and caps WebSocket messages. Cloudera documents `CDSW_APP_PORT` and localhost binding in its [ML runtime environment variables](https://docs.cloudera.com/machine-learning/cloud/runtimes/ml-runtimes.pdf). |
 | Blocking | MoM/QoQ/YoY bands transformed marginal lower/upper quantiles instead of posterior paths | Artifacts now retain all natural-unit draws; transformed medians and bands are calculated from complete paths, preserving horizon dependence. |
-| Blocking | Pickle loaded without transfer-integrity or structural checks | Artifact schema raised to v3; precompute writes an atomic SHA-256 sidecar; startup verifies digest, type, schema, shapes, dates, variables, intervals, fit state, and finite values before serving. |
+| Blocking | Pickle loaded without transfer-integrity or structural checks | Artifact schema raised to v5; precompute writes an atomic SHA-256 sidecar; startup verifies digest, the configured 22-series panel, mixed-frequency posterior/state shapes, dates, covariance definiteness, diagnostics, fit state, and finite values before serving. |
 | Blocking | Scenario scale changes caused reactive cell replacement and could discard unsaved entries | Replaced per-variable reactive strips with one client-side scenario matrix. Scale changes update units, history, placeholders, and labels without replacing inputs. |
 | Required | Scenario jobs were not globally bounded and repeat requests recomputed identical results | Added an allocation-aware semaphore and a deterministic 32-result LRU cache. Default concurrency follows `CDSW_CPU_MILLICORES` and is capped at four. |
 | Required | The artifact was deserialized once per browser session | It is validated and loaded once at process startup, then shared read-only across sessions. Invalid artifacts fail startup instead of presenting a superficially healthy app. |
 | Required | No dedicated health endpoint; root could be healthy while the model was unusable | Added `/healthz` with artifact vintage/schema and cache status. Configure `CDSW_APP_POLLING_ENDPOINT=/healthz`; Cloudera documents this variable in [Application polling endpoint](https://docs.cloudera.com/machine-learning/cloud/site-administration/topics/ml-custom-polling-endpoint.html). |
 | Required | Framework errors could expose internals | Enabled Shiny error sanitization, limited user-facing failures to validated input/model messages, and logs unexpected failures server-side. |
 | Required | Browser depended on Google Fonts; bundled Highcharts 9.3.1 required a separate commercial-license decision | Removed all browser egress. Replaced it with local Apache ECharts 6.1.0 and retained its Apache-2.0 `LICENSE` and `NOTICE`. |
-| Required | Dependency lower bounds did not give CML a reproducible installation | Added upper compatibility bounds, retained `uv.lock`, exported hash-locked `requirements-cml.txt`, and added an isolated `.cml-venv` setup script. Cloudera recommends installing pinned packages locally to the project in its [ML Runtimes guide](https://docs.cloudera.com/machine-learning/1.5.5/runtimes/ml-pvc-runtimes.pdf). |
+| Required | Dependency lower bounds did not give CML a reproducible installation | Added upper compatibility bounds, retained `uv.lock`, exported hash-locked `requirements-cml.txt`, and added a staged, versioned `.cml-venv` setup script with atomic activation and rollback. Cloudera recommends installing pinned packages locally to the project in its [ML Runtimes guide](https://docs.cloudera.com/machine-learning/1.5.5/runtimes/ml-pvc-runtimes.pdf). |
 | Required | FRED cache writes could leave a partial CSV; malformed caches leaked parser errors | Cache writes are atomic; reads reject malformed/empty data, normalize dates, and collapse duplicate months deterministically. |
-| Required | Scenario entry required five independent horizontal scrollers and had weak state feedback | Rebuilt it as one sticky, keyboard-accessible month matrix with actual/forecast labels, live constraint count, baseline placeholders, responsive layout, and contextual units. |
+| Required | Scenario entry did not scale beyond a handful of series and had weak state feedback | Rebuilt it as one searchable, block-filtered, sticky, keyboard-accessible month matrix with actual/forecast labels, live constraint count, baseline placeholders, responsive layout, and contextual units. |
 | Required | Charts omitted scenario uncertainty and lacked an explicit accessible description | Both baseline and scenario path intervals render; charts use responsive SVG and ARIA descriptions. Resize observers dispose cleanly and avoid feedback loops. |
+| Required | Historical-state uncertainty semantics were implicit | Published history remains fixed for displayed values and early growth anchors; retained terminal states stay paired with their forecast parameter draws and continue to affect forecast dynamics. The contract is recorded in future release metadata without adding paired historical draws or changing artifact schema. |
 | Required | No response hardening | Added `nosniff`, same-origin referrer policy, and a restrictive permissions policy without breaking CML iframe/proxy behavior. |
 | Suggestion | FRED/API cache error text referred to entering a key in a UI that had no such control | Corrected the operational message. |
 
 ## Measured performance and capacity
 
-Measurements were taken locally on Linux/Python 3.13 with the production artifact (400 draws,
-12 months, 5 variables). They are sizing evidence, not a substitute for monitoring on the target
-CML node:
-
-| Measurement | Result |
-|---|---:|
-| Artifact load | about 0.002 seconds |
-| Process RSS after production app startup and browser use | about 200 MiB |
-| First two-constraint scenario | about 0.55 seconds |
-| Cached identical scenario | under 0.01 milliseconds in-process |
-| Seven unique scenarios with two worker slots | 3.46 seconds wall time |
-| Peak standalone RSS after eight cached scenarios | about 198 MiB |
-| Root HTML | about 18 KiB |
-| Production artifact | about 357 KiB |
+The earlier five-variable timing measurements are not representative of the 22-variable model and
+have intentionally been removed. Benchmark artifact load, first and cached scenarios, peak RSS,
+and two-worker throughput on the target CML runtime before treating the sizing below as final.
 
 Sizing policy:
 
@@ -82,7 +74,8 @@ Sizing policy:
 - **Higher concurrency:** 4 vCPU, 4 GiB, concurrency 4. Use only after CML monitoring shows demand;
   the workload does not benefit from a GPU.
 - Keep `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and
-  `NUMEXPR_NUM_THREADS` at 1. The matrices are small; nested BLAS threads add contention.
+  `NUMEXPR_NUM_THREADS` at 1 initially; raise them only after measuring the larger matrices under
+  concurrent scenario load, because nested BLAS threads can add contention.
 - Do not configure more scenario slots than vCPU. A single CML Analytical Application is a
   stateful WebSocket process, not a horizontally autoscaled stateless service.
 
@@ -102,14 +95,24 @@ scenario wait time exceeds two seconds; investigate before increasing memory if 
    python scripts/setup_cml.py
    ```
 
-   This recreates `.cml-venv`, installs every transitive dependency from hash-locked
-   `requirements-cml.txt`, adds the local `src/` package path, and performs import checks. No root
-   privileges are needed.
-3. Confirm the checked-in artifact files exist:
+   This builds a new environment under `.cml-venvs/.staging-*`, installs every transitive dependency
+   from hash-locked `requirements-cml.txt`, adds the local `src/` package path, and performs import
+   checks before activation. It then atomically replaces the `.cml-venv` launcher symlink with a
+   pointer to the validated `.cml-venvs/env-*` release. No root privileges are needed.
+
+   The active environment is never cleared in place. If installation or validation fails, the
+   staging directory is removed and the existing `.cml-venv` remains active. A legacy real
+   `.cml-venv` directory is moved into the versioned store (not deleted) during the first upgrade;
+   a failed activation restores it.
+3. Confirm the selected release files exist and validate as one set:
 
    ```bash
-   .cml-venv/bin/python -c "from us_bvar.artifact import load_artifact; load_artifact('artifacts/bvar_forecast.pkl')"
+   .cml-venv/bin/python -c "from pathlib import Path; from us_bvar.artifact import load_published_release; print(load_published_release(Path.cwd()).release_id)"
    ```
+
+   If `artifacts/active.json` is absent, this intentionally validates the checked-in legacy
+   artifact during migration.
+
 4. Create a CML Analytical Application with:
 
    - Script: `cml_entry.py`
@@ -125,8 +128,8 @@ scenario wait time exceeds two seconds; investigate before increasing memory if 
    files and CML role policy are appropriate.
 6. Smoke-test through the final CML URL, not only in a Session:
 
-   - `/healthz` returns HTTP 200, `status=ok`, schema 3, and the expected `panel_end`;
-   - five charts render and transformations change without browser console errors;
+   - `/healthz` returns HTTP 200, `status=ok`, schema 5, and the expected `panel_end`;
+   - the default six charts render and transformations change without browser console errors;
    - open the scenario matrix, switch CPI to QoQ, enter one value, and run;
    - the scenario chip, orange path/band, and table scenario columns appear;
    - clear returns to baseline; repeat on a narrow browser viewport;
@@ -142,19 +145,27 @@ Model refresh should be a separately authorized CML Job, never a request-time ac
 FRED_API_KEY=... .cml-venv/bin/python scripts/precompute.py
 ```
 
-The job writes the panel, model artifact, digest, and metadata atomically where possible. Review the
-new sample end, observation count, checksums, and forecast before restarting the application. The
-running process intentionally keeps its already validated artifact until restart, so users never see
-a half-updated model.
+The job stages the panel, model artifact, digest, and metadata in a versioned release directory,
+validates all digests and the artifact loader, then atomically replaces the small `active.json` pointer.
+Review the new sample end, observation count, checksums, forecast, and `history_semantics` metadata
+before restarting the application. Published history is fixed: early growth anchors use the displayed
+history, while paired terminal-state uncertainty still affects forecast dynamics. The running process
+intentionally keeps its already validated release until restart, so users never see a half-updated model.
+If staging or validation fails, the previous pointer is untouched. The
+same staged/atomic pattern applies to the CML Python environment; retain the prior `.cml-venvs/env-*`
+release until the new application has passed its smoke test, then remove only retired environments.
 
 Operational checks:
 
 - Poll `/healthz`; alert on non-200 or a stale `panel_end` according to the agreed release calendar.
 - Monitor CPU, RSS, application restarts, server exceptions, and user-reported scenario latency.
-- Refresh at most after the required five FRED series share a new complete month; the balanced panel
-  deliberately ignores the ragged release edge.
-- Roll back by restoring the prior commit/artifact pair and restarting the CML Application. Never
-  mix an artifact with a different schema/code revision.
+- Refresh after material source releases. The ragged panel preserves source-specific endpoints, and
+  the Kalman filter nowcasts missing monthly values and latent monthly GDP at the release edge. Do not
+  interpret fixed early anchors as paired historical uncertainty; inspect the release `history_semantics`
+  fields when documenting a vintage.
+- Roll back by restoring the prior `active.json` pointer (the old release directory is retained)
+  and restarting the CML Application. During migration, remove/omit the pointer to use the checked-in
+  legacy artifact. Never mix an artifact with a different schema/code revision.
 
 ### Structured usage telemetry
 
@@ -168,7 +179,7 @@ on-premises application startup/run logs are described in
 Event catalog:
 
 | Event | Meaning | Useful fields |
-|---|---|---|
+| --- | --- | --- |
 | `application_started` | A dashboard process loaded and validated its artifact | artifact schema, panel end, draw count, cache size, concurrency |
 | `session_started` | A browser established a Shiny session | random session correlation token |
 | `session_ended` | A browser session disconnected | correlation token, session duration |
@@ -204,11 +215,13 @@ Minimum useful queries in the chosen log platform:
 - `uv sync --frozen`
 - `uv run ruff check .`
 - `uv run ruff format --check .`
-- `uv run pytest` — 42 tests passed
-- Offline artifact rebuild and checksum verification
+- `uv run pytest` — 56 tests passed
+- Two-chain mixed-frequency artifact rebuild, MCMC release diagnostics, and checksum
+  verification
 - HTTP checks for `/` and `/healthz`, including security headers
-- Real Chromium/Playwright flow: five SVG charts, no console errors, scenario modal, scale change,
-  numeric entry, live constraint count, conditional run, result state, and 390×844 viewport
+- Real Chrome flow: searchable variable workspace, six default SVG charts, mixed-frequency labels, scenario modal, GDP QoQ entry,
+  conditional result, clear-to-baseline, and 390×844 responsive screenshot; no page errors or
+  actionable network failures
 - Structured telemetry inspection for application, session, click, request, completion, and
   disconnect events with no scenario values or user identifiers
 - Cold/cached/concurrent timing and RSS measurements reported above

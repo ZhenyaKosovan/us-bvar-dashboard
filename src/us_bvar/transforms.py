@@ -64,7 +64,11 @@ def transform_path(
     series_spec: SeriesSpec,
     transformation: PlotTransformation,
 ) -> pd.Series:
-    """Convert a natural-unit path to one of the dashboard display scales."""
+    """Convert a natural-unit path to one of the dashboard display scales.
+
+    The supplied historical prefix is the fixed history displayed by the dashboard;
+    this presentation transform does not introduce historical posterior draws.
+    """
 
     spec = transformation_spec(transformation)
     if transformation == "level":
@@ -89,7 +93,11 @@ def transform_forecast_samples(
     series_spec: SeriesSpec,
     transformation: PlotTransformation,
 ) -> np.ndarray:
-    """Transform forecast draws while preserving their cross-horizon dependence."""
+    """Transform forecast draws while preserving their cross-horizon dependence.
+
+    ``history`` is the fixed displayed history used for any early forecast anchor;
+    uncertainty is retained across the forecast path, not backfilled into history.
+    """
 
     values = np.asarray(samples, dtype=float)
     if values.ndim != 2:
@@ -126,16 +134,17 @@ class LevelTransformer:
     @classmethod
     def fit(cls, levels: pd.DataFrame, specs: tuple[SeriesSpec, ...]) -> LevelTransformer:
         latent = cls._latent(levels.to_numpy(dtype=float), specs)
-        scales = latent.std(axis=0, ddof=1)
-        if np.any(~np.isfinite(scales)) or np.any(scales <= 0):
-            raise ValueError("Every model variable must have positive finite sample variance.")
-        return cls(specs=specs, means=latent.mean(axis=0), scales=scales)
+        scales = np.nanstd(latent, axis=0, ddof=1)
+        means = np.nanmean(latent, axis=0)
+        if np.any(~np.isfinite(means)) or np.any(~np.isfinite(scales)) or np.any(scales <= 0):
+            raise ValueError("Every model variable must have positive finite observed variance.")
+        return cls(specs=specs, means=means, scales=scales)
 
     def encode_frame(self, levels: pd.DataFrame) -> pd.DataFrame:
         ids = [spec.series_id for spec in self.specs]
         latent = self._latent(levels[ids].to_numpy(dtype=float), self.specs)
         values = (latent - self.means) / self.scales
-        return pd.DataFrame(values, index=levels.index, columns=ids)
+        return pd.DataFrame(values, index=levels.index, columns=pd.Index(ids, dtype="object"))
 
     def encode_value(self, variable_index: int, natural_value: float) -> float:
         if not np.isfinite(natural_value):
@@ -147,7 +156,9 @@ class LevelTransformer:
             latent = np.log(natural_value)
         else:
             latent = natural_value
-        return float((latent - self.means[variable_index]) / self.scales[variable_index])
+        return np.asarray(
+            (latent - self.means[variable_index]) / self.scales[variable_index]
+        ).item()
 
     def decode_array(self, model_values: np.ndarray) -> np.ndarray:
         latent = model_values * self.scales + self.means
@@ -162,7 +173,8 @@ class LevelTransformer:
         result = values.copy()
         for index, spec in enumerate(specs):
             if spec.transform == "log":
-                if np.any(values[..., index] <= 0):
+                observed = np.isfinite(values[..., index])
+                if np.any(values[..., index][observed] <= 0):
                     raise ValueError(f"{spec.short_label} contains a non-positive value.")
                 result[..., index] = np.log(values[..., index])
         return result

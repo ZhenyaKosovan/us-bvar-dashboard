@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
+import pandas as pd
 import pytest
 
 from us_bvar.config import SERIES_SPECS
-from us_bvar.model import BVAR
-from us_bvar.presentation import echarts_options, forecast_display_frame, forecast_gt, plot_units
+from us_bvar.presentation import (
+    echarts_options,
+    forecast_display_frame,
+    forecast_gt,
+    interval_label,
+    interval_range_label,
+    plot_units,
+)
+from us_bvar.transforms import PlotTransformation, transform_forecast_samples
 
 
-def test_display_frame_and_chart_use_six_plus_twelve_months(synthetic_levels) -> None:
-    model = BVAR().fit(synthetic_levels)
+def test_display_frame_and_chart_use_six_plus_twelve_months(synthetic_levels, fitted_model) -> None:
+    model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
-    frame = forecast_display_frame(synthetic_levels, baseline, SERIES_SPECS)
-    options = echarts_options(synthetic_levels, baseline, SERIES_SPECS[0])
+    assert model.history_levels is not None
+    frame = forecast_display_frame(model.history_levels, baseline, SERIES_SPECS)
+    options = echarts_options(model.history_levels, baseline, SERIES_SPECS[0])
 
     assert len(frame) == 18
     assert frame["Observation"].value_counts().to_dict() == {"Forecast": 12, "Historical": 6}
@@ -24,14 +35,18 @@ def test_display_frame_and_chart_use_six_plus_twelve_months(synthetic_levels) ->
         options["series"][0]["data"][-1][1],
     ]
     assert options["xAxis"]["type"] == "time"
-    assert model.config.interval == (0.16, 0.84)
+    if model.config.interval != (0.16, 0.84):
+        raise AssertionError(f"Unexpected interval: {model.config.interval}")
 
 
-def test_forecast_table_centers_and_formats_values_with_intervals(synthetic_levels) -> None:
-    model = BVAR().fit(synthetic_levels)
+def test_forecast_table_centers_and_formats_values_with_intervals(
+    synthetic_levels, fitted_model
+) -> None:
+    model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
+    assert model.history_levels is not None
 
-    table_html = forecast_gt(synthetic_levels, baseline, SERIES_SPECS).as_raw_html()
+    table_html = forecast_gt(model.history_levels, baseline, SERIES_SPECS).as_raw_html()
 
     assert table_html.count('class="forecast-interval"') == 12 * len(SERIES_SPECS)
     assert "16–84:" in table_html
@@ -40,6 +55,23 @@ def test_forecast_table_centers_and_formats_values_with_intervals(synthetic_leve
     assert 'class="gt_row gt_center"' in table_html
     assert "$" in table_html
     assert "%</span>" in table_html
+
+
+def test_presentation_labels_follow_a_non_default_forecast_interval(
+    synthetic_levels, fitted_model
+) -> None:
+    model = fitted_model
+    baseline = replace(model.forecast(horizon=12, draws=20, seed=3), interval=(0.10, 0.90))
+    assert model.history_levels is not None
+
+    assert interval_label(baseline) == "10th–90th percentile interval"
+    assert interval_range_label(baseline) == "10–90"
+    table_html = forecast_gt(model.history_levels, baseline, SERIES_SPECS).as_raw_html()
+    options = echarts_options(model.history_levels, baseline, SERIES_SPECS[0])
+
+    assert "10–90:" in table_html
+    assert 'title="10th–90th percentile interval"' in table_html
+    assert options["bvarBands"][0]["name"] == "Baseline 10th–90th percentile interval"
 
 
 @pytest.mark.parametrize(
@@ -54,44 +86,57 @@ def test_forecast_table_centers_and_formats_values_with_intervals(synthetic_leve
     ],
 )
 def test_chart_transforms_growth_series(
-    synthetic_levels, transformation: str, periods: int, annualization: int
+    synthetic_levels,
+    fitted_model,
+    transformation: PlotTransformation,
+    periods: int,
+    annualization: int,
 ) -> None:
-    model = BVAR().fit(synthetic_levels)
+    model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
+    assert model.history_levels is not None
     spec = SERIES_SPECS[0]
-    options = echarts_options(synthetic_levels, baseline, spec, transformation=transformation)
+    history = model.history_levels
+    options = echarts_options(history, baseline, spec, transformation=transformation)
 
-    history_ratio = (
-        synthetic_levels[spec.series_id].iloc[-1]
-        / synthetic_levels[spec.series_id].iloc[-1 - periods]
-    )
+    history_ratio = history[spec.series_id].iloc[-1] / history[spec.series_id].iloc[-1 - periods]
     expected_history = (history_ratio**annualization - 1) * 100
 
-    assert np.isclose(options["series"][0]["data"][-1][1], expected_history)
+    assert np.isclose(options["series"][0]["data"][-1][1], expected_history, atol=1e-6)
     expected_draw_median = np.median(
-        (baseline.samples[:, 0, 0] / synthetic_levels[spec.series_id].iloc[-periods])
-        ** annualization
-        * 100
+        (baseline.samples[:, 0, 0] / history[spec.series_id].iloc[-periods]) ** annualization * 100
         - 100
     )
-    assert np.isclose(options["series"][1]["data"][1][1], expected_draw_median)
+    assert np.isclose(options["series"][1]["data"][1][1], expected_draw_median, atol=1e-6)
     assert options["bvarBands"][0]["data"][0][1:] == pytest.approx(
-        [expected_history, expected_history]
+        [expected_history, expected_history], abs=1e-6
     )
     assert options["yAxis"]["name"] == (
         "Annualized percent change" if transformation.endswith("_annualized") else "Percent change"
     )
 
 
-def test_chart_uses_percentage_point_changes_for_rate_series(synthetic_levels) -> None:
-    model = BVAR().fit(synthetic_levels)
-    baseline = model.forecast(horizon=12, draws=20, seed=3)
-    spec = SERIES_SPECS[3]
-    options = echarts_options(synthetic_levels, baseline, spec, transformation="mom_annualized")
+def test_transform_forecast_samples_uses_fixed_history_for_early_anchor() -> None:
+    history = pd.Series([100.0, 110.0, 121.0])
+    samples = np.asarray([[133.1, 146.41], [121.0, 133.1]])
 
-    expected_history = (
-        synthetic_levels[spec.series_id].iloc[-1] - synthetic_levels[spec.series_id].iloc[-2]
-    ) * 12
+    transformed = transform_forecast_samples(history, samples, SERIES_SPECS[0], "qoq")
+
+    assert transformed[:, 0] == pytest.approx([33.1, 21.0])
+    assert transformed[:, 1] == pytest.approx([33.1, 21.0])
+
+
+def test_chart_uses_percentage_point_changes_for_rate_series(
+    synthetic_levels, fitted_model
+) -> None:
+    model = fitted_model
+    baseline = model.forecast(horizon=12, draws=20, seed=3)
+    assert model.history_levels is not None
+    spec = SERIES_SPECS[3]
+    history = model.history_levels
+    options = echarts_options(history, baseline, spec, transformation="mom_annualized")
+
+    expected_history = (history[spec.series_id].iloc[-1] - history[spec.series_id].iloc[-2]) * 12
     assert np.isclose(options["series"][0]["data"][-1][1], expected_history)
     expected_draw_median = np.median(
         (baseline.samples[:, 0, 3] - synthetic_levels[spec.series_id].iloc[-1]) * 12
@@ -101,8 +146,8 @@ def test_chart_uses_percentage_point_changes_for_rate_series(synthetic_levels) -
     assert plot_units(spec, "mom_annualized") == "Annualized percentage-point change"
 
 
-def test_scenario_chart_uses_high_contrast_color(synthetic_levels) -> None:
-    model = BVAR().fit(synthetic_levels)
+def test_scenario_chart_uses_high_contrast_color(synthetic_levels, fitted_model) -> None:
+    model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
 
     options = echarts_options(

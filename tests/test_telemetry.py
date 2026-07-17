@@ -18,7 +18,9 @@ def test_telemetry_event_is_structured_and_omits_scenario_values() -> None:
     assert payload["constraint_count"] == 2
     assert payload["variables"] == ["CPIAUCSL", "FEDFUNDS"]
     assert "scenario_values" not in payload
-    assert payload["timestamp"].endswith("Z")
+    timestamp = payload["timestamp"]
+    assert isinstance(timestamp, str)
+    assert timestamp.endswith("Z")
 
 
 def test_telemetry_can_be_disabled(monkeypatch) -> None:

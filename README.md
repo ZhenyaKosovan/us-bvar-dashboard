@@ -1,7 +1,10 @@
+<!-- markdownlint-disable MD013 -->
+
 # US Bayesian VAR scenario dashboard
 
-A Shiny for Python application for exploring a compact monthly US macroeconomic Bayesian vector
-autoregression (BVAR). It displays a precomputed 12-month baseline forecast and lets a user impose
+A Shiny for Python application for exploring a medium-scale mixed-frequency US macroeconomic Bayesian
+vector autoregression (BVAR). Quarterly real GDP is represented by a latent monthly state inferred
+jointly with monthly indicators. The dashboard displays a precomputed 12-month baseline and lets a user impose
 exact assumptions on one or more future values. The model then recomputes the joint conditional
 distribution of every variable and month—not merely the cells the user edited.
 
@@ -10,7 +13,7 @@ runtime boundaries, UI behavior, browser/server connection, production deploymen
 to change when extending the application.
 
 > [!IMPORTANT]
-> Scenarios are conditional projections from a deliberately small reduced-form model. They are not
+> Scenarios are conditional projections from a reduced-form model. They are not
 > identified causal interventions, policy recommendations, or Federal Reserve forecasts.
 
 ## Contents
@@ -38,33 +41,41 @@ to change when extending the application.
 
 ## What the application does
 
-The dashboard models five monthly US series:
+The dashboard models 22 latent monthly US variables from mixed-frequency releases:
 
-| FRED ID | UI label | Model encoding | Level units |
-|---|---|---|---|
-| `INDPRO` | Industrial production | log, then standardized | Index, 2017=100 |
-| `PCEC96` | Real personal consumption expenditures | log, then standardized | Billions of chained 2017 dollars, SAAR |
-| `CPIAUCSL` | Consumer Price Index | log, then standardized | Index, 1982–84=100 |
-| `UNRATE` | Unemployment rate | standardized level | Percent |
-| `FEDFUNDS` | Effective federal funds rate | standardized level | Percent |
+| Block | FRED IDs | Coverage |
+| --- | --- | --- |
+| Activity | `GDPC1`, `PCEC96`, `INDPRO`, `RRSFS`, `CMRMTSPL`, `HOUST`, `PERMIT`, `DGORDER` | Output, spending, production, sales, housing, and orders |
+| Labor | `UNRATE`, `PAYEMS`, `CIVPART`, `AWHAETP`, `CES0500000003` | Employment, participation, hours, and earnings |
+| Prices | `CPIAUCSL`, `CPILFESL`, `PCEPI`, `PCEPILFE`, `PPIFIS` | Headline, core, consumer, and producer prices |
+| Financial | `FEDFUNDS`, `GS10`, `BAA10Y`, `M2SL` | Policy, long rates, credit spreads, and money |
 
-At build/refresh time, `scripts/precompute.py` downloads or reads cached FRED observations, keeps
-only months observed for every series, estimates the BVAR, simulates a baseline, and writes a
-versioned artifact. At application startup, `app.py` validates and loads that artifact once. It does
-not fetch data or refit the model during a browser session.
+All quantity, price-index, earnings, and money series are logged and standardized. Rates, spreads,
+participation, and hours are standardized in levels. `GDPC1` is quarterly; the other 21 releases
+are monthly.
+
+At build/refresh time, `scripts/precompute.py` downloads or reads cached FRED observations, retains
+the ragged monthly calendar, maps quarterly GDP to quarter-end months, estimates the latent-state
+BVAR with Gibbs sampling and Kalman simulation smoothing, simulates a baseline, and stages a complete
+versioned release. It validates the panel, artifact, checksum, and metadata before atomically
+replacing `artifacts/active.json`. At application startup, `app.py` validates and loads the release
+selected by that pointer once. It does not fetch data or refit the model during a browser session.
 
 Users can:
 
-1. Inspect six actual months and twelve forecast months in five charts.
-2. Switch each chart independently between level, MoM, QoQ, YoY, and annualized variants.
-3. Open a single scenario matrix covering all five variables and twelve forecast months.
-4. Enter any sparse set of future assumptions, in a separately chosen scale for each row.
-5. Compare baseline and conditional medians plus 16th–84th percentile intervals.
-6. Clear the conditional result and return to the immutable baseline.
+1. Choose a readable working set of up to eight variables from the full 22-series model.
+2. Inspect six historical/estimated months and twelve forecast months in responsive charts.
+3. Switch each chart independently between level, MoM, QoQ, YoY, and annualized variants.
+4. Search or filter a scenario matrix covering all 22 variables and twelve forecast months.
+5. Enter any sparse set of future assumptions, in a separately chosen scale for each row.
+6. Compare baseline and conditional medians plus the configured pointwise percentile intervals.
+7. Clear the conditional result and return to the immutable baseline.
 
-The current checked-in artifact is described by `artifacts/metadata.json`. Treat that file as the
-authoritative human-readable statement of the data vintage, checksums, number of observations,
-forecast dates, draw count, and model configuration.
+The active release selected by `artifacts/active.json` has a `metadata.json` file that is the
+authoritative human-readable statement of the data vintage, checksums, calendar length,
+source-specific observation counts, forecast dates, draw count, and model configuration. During
+migration, a missing `artifacts/active.json` deliberately falls back to the checked-in legacy
+artifact; an invalid active pointer fails startup rather than silently selecting a mixed release.
 
 ## Architecture
 
@@ -77,17 +88,15 @@ flowchart LR
         FRED[FRED observations API]
         Cache[(Per-series CSV cache)]
         Precompute[scripts/precompute.py]
-        Panel[data/fred_panel.csv]
-        Artifact[Forecast artifact]
-        Digest[SHA-256 sidecar]
-        Metadata[metadata.json]
+        Stage[Complete versioned release]
+        Pointer[active.json pointer]
+        Panel[Panel + artifact + checksum + metadata]
 
         FRED --> Precompute
         Cache <--> Precompute
-        Precompute --> Panel
-        Precompute --> Artifact
-        Precompute --> Digest
-        Precompute --> Metadata
+        Precompute --> Stage
+        Stage --> Panel
+        Stage --> Pointer
     end
 
     subgraph Runtime[Long-running Shiny process]
@@ -162,39 +171,44 @@ sequenceDiagram
 
 ```text
 .
-├── app.py                         Shiny UI, server logic, browser JS, health route
+├── app.py                         Stable Shiny production entrypoint
 ├── cml_entry.py                   Production CML launcher
 ├── CML_DEPLOYMENT.md              Detailed production readiness and operations guide
 ├── pyproject.toml                 Package metadata and uv/dev dependency constraints
 ├── requirements-cml.txt           Hash-locked production dependency set
 ├── scripts/
 │   ├── precompute.py              Data refresh, fit, baseline, artifact, metadata
-│   └── setup_cml.py               Rebuild .cml-venv from the hash-locked requirements
+│   └── setup_cml.py               Stage and atomically activate a versioned CML environment
 ├── src/us_bvar/
 │   ├── config.py                  Series metadata and pandemic-control months
-│   ├── data.py                    FRED client, cache handling, balanced-panel validation
+│   ├── data.py                    FRED client, cache handling, ragged-panel construction
+│   ├── state_space.py             Companion state, Kalman filter, simulation smoother
 │   ├── transforms.py              Model encoding and display/scenario transformations
-│   ├── model.py                   BVAR estimation and conditional simulation
+│   ├── model.py                   Mixed-frequency BVAR Gibbs estimation and simulation
 │   ├── artifact.py                Artifact schema, atomic save, checksum, validation
 │   ├── presentation.py            Chart options, quantiles, units, and Great Tables output
+│   ├── dashboard.py               Injectable runtime, UI/server composition, health/security
 │   └── telemetry.py               Privacy-conscious JSON event logging
 ├── data/
-│   ├── fred_panel.csv             Last generated balanced panel
+│   ├── fred_panel.csv             Last generated ragged observation matrix
 │   └── cache/                     Ignored per-series download cache, if present
 ├── artifacts/
-│   ├── bvar_forecast.pkl          Fitted model, history, baseline, and baseline draws
-│   ├── bvar_forecast.pkl.sha256   Integrity digest checked before deserialization
-│   └── metadata.json              Reviewable artifact/vintage metadata
+│   ├── active.json                Atomic pointer to the validated release (optional during migration)
+│   ├── releases/<release-id>/     Immutable panel, artifact, checksum, and metadata bundle
+│   ├── bvar_forecast.pkl          Checked-in legacy fallback artifact
+│   ├── bvar_forecast.pkl.sha256   Legacy artifact integrity digest
+│   └── metadata.json              Legacy/reviewable artifact-vintage metadata
 ├── www/
 │   ├── app.css                    Entire visual system and responsive layout
+│   ├── app.js                     Local chart/scenario browser bootstrap module
 │   ├── favicon.svg
 │   └── vendor/echarts/            Locally served ECharts bundle, LICENSE, and NOTICE
-└── tests/                          Deterministic unit and source-contract tests
+└── tests/                          Deterministic unit, generated-output, and HTTP tests
 ```
 
-Generated virtual environments (`.venv/`, `.cml-venv/`), `.env`, FRED cache CSVs, Python caches,
-and tool caches are ignored. The balanced panel and deployable artifact are intentionally present in
-the repository so the dashboard can start without FRED access.
+Generated virtual environments (`.venv/`, `.cml-venv/`, `.cml-venvs/`), `.env`, FRED cache CSVs,
+Python caches, and tool caches are ignored. The ragged audit panel and deployable artifact are intentionally present
+in the repository so the dashboard can start without FRED access.
 
 ## Data and model lifecycle
 
@@ -206,30 +220,29 @@ the repository so the dashboard can start without FRED access.
 - The default requested start is January 1985.
 - Each series is requested independently and successful responses are atomically cached as
   `data/cache/<SERIES_ID>.csv`.
-- Dates are normalized to month starts. Non-numeric FRED values such as `.` become missing and are
-  dropped.
+- Monthly dates are normalized to month starts. Quarterly FRED dates are mapped from the first month
+  of the quarter to the quarter-ending month. Non-numeric values such as `.` become missing.
 - With no API key, a valid cache is required.
 - With an API key, an HTTP/parsing failure falls back to the corresponding valid cache.
 - Cache reads reject unreadable files, missing columns, empty results, and invalid dates. Duplicate
   months collapse deterministically to the last value.
 
-`fetch_panel()` concatenates the five series with an inner join and drops missing rows. This means
-the panel ends at the newest month available for *all* series; it does not fill the ragged release
-edge. It requires at least 120 complete months and rejects non-positive values in log-encoded
-series.
+`fetch_panel()` takes an outer join, creates a contiguous monthly calendar, and preserves missing
+releases. The sample begins when every monthly series has started and ends at the newest available
+monthly observation. GDP is present only in March, June, September, and December when that quarter
+has been released; differing monthly release endpoints remain missing. The panel requires at least
+120 calendar months and rejects observed non-positive values in log-encoded series.
 
-The exact series choices mean the requested 1985 start does not guarantee a panel beginning in
-1985. In the current artifact, the common sample begins in 2007 because that is the first common
-month for all five series. Industrial production is used as a monthly output proxy because real GDP
-is quarterly; real PCE supplies an additional monthly demand measure.
+The checked-in `data/fred_panel.csv` is therefore an audit copy of the ragged observation matrix,
+not an interpolated GDP series. `PanelData.last_observations` records the endpoint of each source.
 
 ### 2. Encode natural levels
 
 `LevelTransformer.fit()` in `src/us_bvar/transforms.py` learns one sample mean and standard
 deviation per variable.
 
-- `INDPRO`, `PCEC96`, and `CPIAUCSL` are logged, then standardized.
-- `UNRATE` and `FEDFUNDS` are standardized without logging.
+- Quantity, price-index, earnings, and money series are logged where observed, then standardized.
+- Rates, spreads, labor-force participation, and weekly hours are standardized without logging.
 - Forecasts are simulated in this model space and decoded back to natural units before being stored
   in `ForecastResult`.
 
@@ -239,64 +252,112 @@ scales applied around that model.
 
 ### 3. Fit and simulate the baseline
 
-`scripts/precompute.py` constructs `BVAR`, calls `fit()`, and then asks for a 12-month forecast. Its
-CLI defaults are 400 posterior predictive draws and seed `202503`.
+`scripts/precompute.py` constructs `BVAR`, runs two independent 600-iteration Gibbs chains by
+default (300 burn-in, retain every third post-burn-in draw), and asks for 400
+posterior-predictive paths with seed `202503`. Every Gibbs iteration samples a latent monthly path
+with the Kalman simulation smoother, then samples transition coefficients and innovation covariance
+conditional on that path.
 
-The script then writes:
+The script stages four files under `artifacts/releases/<release-id>/`:
 
-- `data/fred_panel.csv`, the exact balanced input panel;
-- `artifacts/bvar_forecast.pkl`, the fitted object plus baseline result;
-- `artifacts/bvar_forecast.pkl.sha256`, created alongside the pickle;
-- `artifacts/metadata.json`, including source, dates, configuration, and panel/artifact digests.
+- `fred_panel.csv`, the exact ragged mixed-frequency observation matrix;
+- `bvar_forecast.pkl`, the fitted object plus baseline result;
+- `bvar_forecast.pkl.sha256`, the artifact digest sidecar;
+- `metadata.json`, including provenance/endpoints, diagnostics, configuration, and panel/artifact
+  digests.
 
-The pickle and checksum use temporary files followed by `os.replace()`. The human-readable panel
-and metadata are written by the orchestration script. Review all four outputs as one versioned
-release unit.
+The refresh fails unless rank-normalized split R-hat is at most 1.10 and rank-based effective
+sample size is at least 20. Future `metadata.json` files also include `history_semantics` with the
+fixed-history anchor mode, terminal-state pairing, and an explicit `paired_historical_draws: false`
+flag. Scalar log likelihood and companion radius are checked directly;
+high-dimensional coefficient, covariance, terminal-state, and latent-path blocks use their 99th
+R-hat and 1st ESS percentiles while still recording absolute extrema and their flat indices. The six
+pandemic-month coefficients are estimated once from the initialized mixed-frequency path and then
+held fixed across Gibbs draws; they are nuisance controls fixed to zero in every forecast. Draws
+with companion radius above 1.10 are rejected from the stability-restricted posterior, and the
+build fails if rejections exceed 25% of scheduled retention attempts.
+
+It validates every staged digest and calls the same artifact loader used by the app before renaming
+the staging directory into its immutable release directory. Only then does it atomically replace the
+small `artifacts/active.json` pointer with `os.replace()`. A failed build leaves the prior pointer and
+release active; completed older release directories remain available for rollback by restoring an
+older pointer. The root checked-in artifact and metadata remain a migration fallback and are never
+partially overwritten by refresh.
 
 ### 4. Load once at application startup
 
-Importing `app.py` immediately calls `load_artifact()`. It exposes the artifact's model, baseline,
-and natural-unit history as module-level read-only-by-convention objects. If the artifact is absent,
-corrupt, structurally inconsistent, or lacks model history, startup fails before the app serves a
-superficially healthy page.
+Importing `app.py` immediately calls `load_published_release()`. With `artifacts/active.json`
+present, it verifies all four release-file digests and metadata before loading the artifact; without
+the pointer it uses the checked-in root artifact for backward-compatible migration. It exposes the
+validated release's model, baseline, and natural-unit history as module-level read-only-by-convention
+objects. A corrupt pointer/release fails startup before the app serves a superficially healthy page.
 
-The running process never notices an artifact replaced on disk. A refresh becomes active only after
-the application process restarts.
+The running process never notices files replaced on disk. A refresh becomes active only after the
+application process restarts. Rollback is a pointer operation: activate a previously retained release
+manifest and restart, without rebuilding MCMC output.
 
 ## Model specification
 
 The defaults are defined by `BVARConfig` in `src/us_bvar/model.py`:
 
 | Setting | Default | Meaning |
-|---|---:|---|
+| --- | ---: | --- |
 | Lags | 4 | Four monthly lags for every variable |
-| Overall tightness | 0.20 | Minnesota prior standard-deviation scale |
-| Cross-variable tightness | 0.50 | Additional shrinkage for another variable's lags |
+| Overall tightness | 0.02 | Minnesota prior standard-deviation scale |
 | Lag decay | 1.0 | Prior standard deviations decay harmonically with lag |
-| Interval | 0.16, 0.84 | Pointwise posterior predictive quantiles shown in the UI |
-| Pandemic controls | Mar–Aug 2020 | Six separate month indicators, zero during forecasts |
+| Own first-lag mean | 0.90 | Persistent but stationary center for each equation |
+| Interval | `BVARConfig.interval` (default `0.16, 0.84`) | Pointwise posterior predictive quantiles shown in the UI |
+| Pandemic controls | Mar–Aug 2020 | Six fixed month indicators, zero during forecasts |
+| Production Gibbs chains | 2 × 600 | 300 burn-in per chain, thinning 3, 200 retained parameter/state draws |
+| Quick/test mode | `BVARConfig.quick()` | Explicitly permits 1 × 8 iterations with 4 burn-in; not a production posterior |
+| Monthly measurement variance | 1e-6 | Treat monthly releases as nearly exact |
+| Quarterly GDP variance | 1e-4 | Allows error around the log-linear aggregation approximation |
+| Maximum companion radius | 1.10 | Stability restriction for retained posterior draws |
+| Maximum unstable rejection fraction | 0.25 | Abort if more than 25% of scheduled draws are unstable |
 
-For five variables, the design row contains an intercept, 20 lagged values, and six pandemic
-controls. Each equation's first own lag has prior mean one; all other coefficient prior means are
-zero. Intercepts and pandemic controls receive diffuse prior variance. The likelihood covariance is
-initialized from a ridge-stabilized OLS estimate and repaired to positive definite if necessary.
+`BVARConfig()` uses the production-sized settings above and requires at least two chains with 20
+retained draws per chain before fitting or forecasting. The `BVARConfig.quick()` factory is the
+explicit escape hatch for deterministic unit tests; it is intentionally undersized and should not
+be used for substantive forecasts. The precompute script keeps production mode explicit and also
+runs the convergence release gates before writing an artifact.
 
-`fit()` combines the equation-specific Minnesota normal priors with the Gaussian likelihood. It
-stores the posterior coefficient mean and Cholesky factor. Innovation covariance uncertainty is
-represented by an inverse-Wishart distribution based on posterior residuals.
+The latent vector follows a monthly VAR(4). Monthly releases directly measure their corresponding
+current state. At an observed quarter end, standardized log `GDPC1` measures one third of each of
+the current and previous two latent monthly GDP states. This is a linear geometric-average
+approximation to the arithmetic averaging underlying quarterly SAAR GDP; it keeps filtering,
+smoothing, and scenario conditioning linear-Gaussian.
 
-For each forecast draw, `forecast()`:
+For 22 variables, the transition design contains an intercept, 88 lagged values, and six fixed
+pandemic-month indicators. Each equation's first own lag has prior mean 0.90; all other coefficient
+prior means are
+zero. The Gibbs sampler alternates:
 
-1. Draws one coefficient vector and one innovation covariance matrix.
-2. Recursively computes the mean path with future pandemic controls fixed to zero.
-3. Constructs moving-average responses for all horizons.
-4. Builds the complete cross-variable, cross-horizon covariance matrix.
-5. Samples the 60-element future vector (12 months × 5 variables), conditionally if required.
-6. Decodes the path to natural units.
+1. a time-varying-measurement Kalman filter and forward-filter/backward-sample state draw;
+2. one exact conjugate matrix-normal/inverse-Wishart draw for the complete transition system,
+   conditional on the latent path and Minnesota-style row shrinkage.
+
+Each forecast path selects a retained coefficient/covariance/terminal-state draw, recursively builds
+the 12-month Gaussian forecast distribution, samples or conditions the 264-element future vector,
+and decodes it to natural units. For a scenario, retained components are first reweighted by the
+marginal Gaussian density of the restriction and then sampled from their component-wise conditional
+distributions. `ForecastResult.component_effective_sample_size` reports weight concentration.
+Parameter, terminal latent-state, and future innovation uncertainty therefore all enter the paths.
 
 The returned `ForecastResult.samples` has shape `(draws, horizon, variables)` and is marked
 non-writeable. Median and interval frames are computed across draws for each point. A fixed seed
 makes a given baseline or canonical scenario reproducible.
+
+### Historical-state uncertainty contract
+
+Published-history semantics are intentionally fixed. The history displayed in charts, tables, and
+the scenario editor is one smoothed posterior summary; early MoM/QoQ/YoY anchors use that displayed
+fixed history. The model does **not** construct paired historical state draws. This makes the anchor
+contract reproducible and keeps historical values aligned across baseline and scenarios.
+
+This does not remove terminal-state uncertainty from forecasts. Each forecast component keeps its
+retained coefficient draw, innovation covariance, and terminal companion state paired by posterior
+draw index. That paired terminal state initializes the forecast dynamics and therefore contributes to
+forecast paths and scenario uncertainty. Future metadata records these semantics explicitly.
 
 Relevant methodological context:
 
@@ -332,6 +393,10 @@ exact conditional distribution using the forecast covariance. As a result:
 
 This is fundamentally different from overwriting baseline values after forecasting.
 
+For `GDPC1`, a scenario cell constrains the **latent monthly GDP path**, not a future official
+quarterly release. QoQ and YoY entries are changes in that latent monthly path. The observed
+quarterly release remains the three-month aggregation defined by the state-space measurement row.
+
 ### Constraint scale conversion
 
 Every non-empty cell becomes a `ScenarioConstraint(value, transformation)`. The row selector
@@ -362,14 +427,14 @@ validation error. Values must be finite and cannot exceed one billion in absolut
 
 ### Page structure
 
-`app_ui` in `app.py` is a `ui.page_fluid` with:
+`build_ui()` in `src/us_bvar/dashboard.py` creates a `ui.page_fluid` with:
 
 1. Local favicon, CSS, ECharts bundle, and bootstrap JavaScript in the document head.
 2. A reactive full-page scenario progress output.
 3. A masthead showing the application name and artifact vintage/build time.
 4. A status bar showing sample/draw/horizon metadata and scenario controls.
-5. Five chart cards generated from `SERIES_SPECS`.
-6. A horizontally scrollable Great Tables forecast table.
+5. A searchable variable workspace capped at eight visible series.
+6. Chart cards and a Great Tables forecast table driven by the same working set.
 7. A compact method/risk note.
 
 The order of `SERIES_SPECS` is a contract used throughout the model, artifact, UI, and table. It is
@@ -380,9 +445,9 @@ also the variable order inside NumPy arrays.
 Each chart card has an independent `plot_transform_<SERIES_ID>` Shiny select. Changing it reruns
 only that chart's reactive renderer. The server builds an ECharts option object containing:
 
-- the last six transformed actual observations;
+- the last six transformed historical values (including latent monthly GDP estimates);
 - a dashed teal baseline median connected to the last actual point;
-- a teal 16th–84th percentile band;
+- a teal band using the configured pointwise percentile interval;
 - when active, an orange scenario median and lighter orange interval;
 - time-axis values in UTC milliseconds, units, decimals, legend, tooltip metadata, and ARIA text.
 
@@ -397,8 +462,9 @@ controls display, the other controls the interpretation of assumptions.
 
 ### Forecast table
 
-The table always uses natural levels; chart selectors do not affect it. It contains six actual rows
-and twelve forecast rows. Each forecast cell shows the median and its pointwise 16th–84th percentile
+The table always uses natural levels; chart selectors do not affect it. It follows the current
+variable workspace selection and contains six actual rows
+and twelve forecast rows. Each forecast cell shows the median and its configured pointwise percentile
 interval. With a scenario active, each variable spanner gains separate Baseline and Scenario
 columns. Historical values are repeated in both columns for alignment.
 
@@ -410,12 +476,13 @@ unreadable columns.
 
 “Build a scenario” inserts an extra-large modal containing one CSS grid:
 
-- one sticky left column for five variable labels, scale selectors, and units;
+- two sticky left columns for 22 variable labels and their scale selectors/units;
 - three sticky-header actual-month columns;
 - twelve forecast-month input columns;
-- 60 text inputs in total.
+- 264 text inputs in total, with client-side name/FRED-ID search and block filtering.
 
-Only forecast cells are editable. Actual values establish context. Blank forecast fields mean “do
+Only forecast cells are editable. Historical/estimated values establish context. Blank forecast
+fields mean “do
 not constrain this point”; their muted placeholders are baseline medians on the currently selected
 scale and are never submitted as constraints.
 
@@ -441,11 +508,11 @@ the applied scenario and disables itself.
 
 ### Running a scenario
 
-The server scans all 60 inputs, parses non-empty fields, and validates that at least one exists. On a
+The server scans all 264 inputs, parses non-empty fields, and validates that at least one exists. On a
 valid request it closes the modal, emits request telemetry, and starts an extended task. A full-page
 status overlay remains visible while the task runs.
 
-On success, the session's `scenario_state` changes. That invalidates all five charts, the table, and
+On success, the session's `scenario_state` changes. That invalidates the visible charts, the table, and
 the scenario summary chip. The Clear button becomes available and a completion notification appears.
 
 On a user-correctable `ValueError`, the exact safe validation message is shown. Unexpected errors are
@@ -457,7 +524,7 @@ fails while an older scenario is active, the older applied result remains in ses
 `www/app.css` defines the dark visual system, spacing, table styles, modal grid, focus states, and
 breakpoints.
 
-- Above 900 px, charts use two columns and the fifth card spans both.
+- Above 900 px, charts use two columns.
 - Below 900 px, the masthead/status sections stack and charts use one column.
 - Below 560 px, padding and chart height reduce and chart controls stack.
 - The scenario matrix keeps its 1600 px minimum layout inside a two-axis scroll container rather
@@ -475,20 +542,22 @@ breakpoints.
 following outputs depend on it:
 
 | Output | Dependencies | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `scenario_progress` | extended-task status | Adds/removes blocking progress overlay |
 | `scenario_summary` | session scenario state | Shows Baseline or Scenario · N chip |
+| `variable_selection_summary` | `visible_variables` | Reports the working-set size |
+| `chart_grid` | `visible_variables` | Inserts cards for the selected working set |
 | `chart_<SERIES_ID>` | its chart selector + scenario state | Rebuilds one chart configuration |
-| `forecast_table` | scenario state | Adds/removes scenario columns |
+| `forecast_table` | working set + scenario state | Selects variables and adds/removes scenario columns |
 
 Event effects handle opening the modal, parsing/running a scenario, consuming task results, clearing
-state, and resetting modal fields. `suspend_when_hidden=False` keeps chart outputs active when their
-containers are not considered visible by Shiny.
+state, and resetting modal fields. Chart outputs suspend when absent from the dynamic workspace and
+resume when their cards are selected.
 
 ### Browser bootstrap script
 
-`browser_bootstrap()` returns the inline JavaScript responsible for behavior that should not require
-a reactive round trip:
+`www/app.js` is the local browser module responsible for behavior that should not require
+a reactive round trip. `browser_bootstrap()` only emits its local script tag:
 
 - discover `.bvar-echart` nodes, including when the inserted node itself is the mutation root;
 - parse chart JSON and convert interval metadata into custom ECharts polygon series;
@@ -497,7 +566,8 @@ a reactive round trip:
 - resize charts with one `ResizeObserver` per chart;
 - detect Shiny DOM replacements with a document-level `MutationObserver`;
 - disconnect observers and dispose ECharts instances before removed nodes leak resources;
-- update scenario row displays and count fields immediately in the browser.
+- update scenario row displays and count fields immediately in the browser;
+- filter the 22-row scenario matrix by label, FRED ID, or macro block without a server round trip.
 
 A JSON-text signature on each chart wrapper prevents redundant initialization. Server-generated JSON
 escapes `</` so data cannot accidentally terminate the containing script element.
@@ -508,7 +578,7 @@ escapes `</` so data cannot accidentally terminate the containing script element
 and annualization factors.
 
 | Key | Label | Lag | Annualization |
-|---|---|---:|---:|
+| --- | --- | ---: | ---: |
 | `level` | Level | 0 | none |
 | `mom` | MoM | 1 month | none |
 | `qoq` | QoQ | 3 months | none |
@@ -532,13 +602,19 @@ the scenario editor and tooltips; level views use the series-specific precision.
 
 ## Artifact format and integrity boundary
 
-`ForecastArtifact` schema version 3 contains:
+`ForecastArtifact` schema version 5 contains:
 
-- creation time, panel start/end, and observation count;
-- the fitted `BVAR`, including transformer, history, and posterior state;
-- the baseline `ForecastResult`, including all natural-unit draws.
+- creation time, monthly calendar start/end, and calendar observation count;
+- the raw ragged observation matrix and observation mask;
+- smoothed complete monthly natural/model histories;
+- retained coefficient, innovation-covariance, terminal-state, and latent-path draws;
+- fixed published-history semantics (early anchors use displayed history; terminal states remain
+  paired with forecast dynamics); these are metadata semantics, not a schema change;
+- the baseline `ForecastResult`, including all natural-unit forecast paths.
 
-`load_artifact()` verifies the SHA-256 sidecar *before* calling `pickle.load()`, then validates:
+`load_published_release()` verifies the active manifest's four file digests and metadata before
+calling `load_artifact()`. `load_artifact()` then verifies the artifact sidecar *before* calling
+`pickle.load()`, and validates:
 
 - Python object type and supported schema;
 - exactly twelve forecast dates;
@@ -559,7 +635,7 @@ pickle, checksum, and metadata together.
 
 ### Process-wide state
 
-The following are created once when `app.py` is imported and shared by all sessions:
+The following are created once when the production runtime is initialized and shared by all sessions:
 
 - validated `ARTIFACT`, fitted `MODEL`, `BASELINE`, and `HISTORY`;
 - an `asyncio.Semaphore` limiting simultaneous scenario calculations;
@@ -597,12 +673,12 @@ allocated vCPU to avoid nested CPU oversubscription.
 ## Connections and security boundaries
 
 | Connection | When | Direction | Data | Notes |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | FRED API | Precompute only | refresh job → FRED | API key, series ID, start date; observations return | Dashboard runtime does not need the key or network |
 | FRED cache | Precompute only | local filesystem ↔ refresh job | One CSV per series | Ignored by Git; enables offline/fallback refresh |
 | Artifact files | Startup | local filesystem → app | Pickled model/baseline plus digest | Loaded and validated once |
 | Browser/Shiny | Runtime | bidirectional | UI inputs and reactive HTML over Shiny HTTP/WebSocket transport | CML proxy supplies external TLS/authentication |
-| Static assets | Runtime | app → browser | CSS, favicon, local ECharts JS | No CDN, font, or browser egress dependency |
+| Static assets | Runtime | app → browser | CSS, favicon, local app.js and ECharts JS | No CDN, font, or browser egress dependency |
 | Telemetry | Runtime | app → stdout | Event names, timings, counts, variable IDs, random session token | No scenario values or CML identity |
 | Health polling | Runtime | CML/monitor → `/healthz` | Artifact vintage/schema and cache occupancy | No-store response |
 
@@ -628,7 +704,7 @@ Shiny error sanitization is enabled and application debug mode is disabled.
 set `BVAR_TELEMETRY_ENABLED=false` (also accepts `0`, `no`, or `off`) to disable it.
 
 | Event | Emitted when | Non-sensitive fields beyond common metadata |
-|---|---|---|
+| --- | --- | --- |
 | `application_started` | Artifact loads and process initializes | schema, panel end, draws, cache size, concurrency |
 | `session_started` | A Shiny session starts | random session token |
 | `session_ended` | Session disconnects | token, duration |
@@ -653,7 +729,9 @@ INFO. The CML launcher separately validates the level passed to Shiny.
 ```json
 {
   "status": "ok",
-  "artifact_schema": 3,
+  "artifact_schema": 5,
+  "release_id": "20260301T120000Z-a1b2c3",
+  "variable_count": 22,
   "panel_end": "2026-05-01",
   "forecast_end": "2027-05-01",
   "scenario_cache": {"size": 0, "max_size": 32}
@@ -704,6 +782,9 @@ uv run python scripts/precompute.py --offline
 
 # Change simulation count and deterministic baseline seed
 uv run python scripts/precompute.py --draws 800 --seed 12345
+
+# Change mixed-frequency Gibbs length, burn-in, and thinning
+uv run python scripts/precompute.py --mcmc-iterations 1200 --burn-in 600 --thin 3 --mcmc-chains 4
 ```
 
 `--offline` deliberately passes an empty API key to `FREDClient`; every required series must already
@@ -712,7 +793,7 @@ have a valid cache. The standard script loads `FRED_API_KEY` from repository-roo
 ### Useful environment variables
 
 | Variable | Used by | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `FRED_API_KEY` | precompute | none | Authenticates fresh FRED requests |
 | `BVAR_LOG_LEVEL` | app and launcher | `INFO` | Operational/Shiny log verbosity |
 | `BVAR_TELEMETRY_ENABLED` | app | `true` | Enables structured usage events |
@@ -722,8 +803,9 @@ have a valid cache. The standard script loads `FRED_API_KEY` from repository-roo
 | `CDSW_APP_PORT` | CML launcher | `PORT`, then `8000` | Local application port |
 | `CDSW_APP_POLLING_ENDPOINT` | CML platform | recommended `/healthz` | Selects health polling route |
 
-The application uses a fixed artifact path (`artifacts/bvar_forecast.pkl`), horizon (12), runtime
-scenario draw count (400), scenario seed, and cache size in `app.py`; these are not environment
+The application uses a fixed 12-month horizon, runtime scenario draw count (400), scenario seed,
+and cache size in `src/us_bvar/dashboard.py`. It loads the validated release selected by `artifacts/active.json`; if the
+pointer is absent during migration, it uses the checked-in legacy artifact. These are not environment
 options.
 
 ## Testing
@@ -736,22 +818,26 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
+GitHub Actions runs this same gate on every push and pull request for Python 3.11, 3.12, and 3.13.
+The workflow installs dependencies with `uv sync --frozen`; the checked-in forecast artifact, panel,
+and local ECharts assets remain available to app tests without FRED or browser automation.
+
 The test suite is intentionally deterministic and organized by boundary:
 
-- `tests/test_data.py`: cache-only FRED behavior and date/value normalization contract.
-- `tests/test_model.py`: reproducibility, output shapes, exact natural/transformed conditions,
-  cross-horizon covariance, input failures, and covariance repair.
+- `tests/test_data.py`: cache behavior, quarter-end GDP mapping, ragged-edge preservation, and validation.
+- `tests/test_model.py`: Kalman measurement aggregation, ragged-edge smoothing, retained companion
+  states, reproducibility, exact natural/transformed conditions, forecast covariance, and failures.
 - `tests/test_artifact.py`: round trip, digest creation, and corruption rejection before unpickling.
 - `tests/test_presentation.py`: history/forecast lengths, transformed posterior summaries, units,
   table formatting, intervals, and scenario contrast.
-- `tests/test_app.py`: generated modal accessibility, 60 input names, local ECharts assets, DOM
-  lifecycle hooks, extended tasks, progress flow, health route, security, and telemetry registration.
+- `tests/test_app.py`: generated modal accessibility, local static-asset HTTP behavior, scenario cache,
+  progress output, health/security HTTP behavior, and injected telemetry.
 - `tests/test_telemetry.py`: event shape, privacy exclusions, and opt-out behavior.
 
-Several app tests inspect source text and generated HTML. Renaming CSS classes, input IDs, or
-reorganizing the bootstrap script can therefore require deliberate test updates even when behavior
-is equivalent. `tests/conftest.py` supplies synthetic positive monthly data so model tests do not use
-FRED or the production artifact.
+App tests exercise generated UI and HTTP/static-asset behavior rather than implementation source strings.
+Renaming CSS classes or input IDs can still require deliberate test updates when behavior changes. `tests/conftest.py` supplies synthetic positive monthly data and uses
+`BVARConfig.quick()` so model tests do not use FRED or the production artifact or incur a
+production-length fit.
 
 For UI changes, also perform a browser smoke test: load all charts, change scales, open the modal,
 enter a constraint, run it, inspect scenario lines/table columns, clear it, and repeat at a narrow
@@ -772,12 +858,14 @@ The short path is:
 5. Set `CDSW_APP_POLLING_ENDPOINT=/healthz`.
 6. Keep unauthenticated access disabled unless explicitly approved.
 
-`scripts/setup_cml.py` clears and recreates `.cml-venv`, installs every dependency from
-`requirements-cml.txt` with hash verification, adds `src/` via a `.pth` file, and verifies imports.
+`scripts/setup_cml.py` builds a staged environment under `.cml-venvs/`, installs every dependency from
+`requirements-cml.txt` with hash verification, adds `src/` via a `.pth` file, and verifies imports before
+atomically switching the `.cml-venv` symlink to the new version. A failed install or validation cleans
+up only its staging directory and leaves the prior active environment untouched.
 
 `cml_entry.py` then:
 
-- validates `.cml-venv` and required artifact/static files;
+- follows the atomically activated `.cml-venv` environment and validates required artifact/static files;
 - validates the selected port;
 - adds `src/` to `PYTHONPATH`;
 - constrains common BLAS thread pools to one by default;
@@ -797,13 +885,14 @@ This is a schema/model change, not just a UI edit.
 
 1. Update `SERIES_SPECS` in `src/us_bvar/config.py`, preserving the intended array order.
 2. Decide whether its natural level is logged or left linear and define its formatting metadata.
-3. Ensure FRED frequency/availability produces enough common monthly observations.
+3. Declare monthly/quarterly frequency and ensure the state-space observation row is correct.
 4. Recompute the artifact and metadata.
 5. Update model, presentation, modal, and artifact tests for the new variable count/order.
 6. Review chart-grid layout and the scenario matrix width.
 
-Do not use quarterly series without an explicit mixed-frequency or interpolation design. The current
-pipeline assumes one observation per series per month and an ordinary balanced VAR.
+Additional quarterly series require an explicit measurement row in
+`src/us_bvar/state_space.py::observation_system()`. Do not forward-fill or interpolate source
+observations before estimation; missingness is part of the Kalman likelihood.
 
 ### Add a display or scenario transformation
 
@@ -817,8 +906,8 @@ pipeline assumes one observation per series per month and an ordinary balanced V
 ### Change charts or table presentation
 
 - Server-side data/quantiles/options: `src/us_bvar/presentation.py`.
-- Card/table composition and reactivity: `app.py`.
-- ECharts instance, ribbons, locale tooltip, resize/disposal: `browser_bootstrap()` in `app.py`.
+- Card/table composition and reactivity: `src/us_bvar/dashboard.py`.
+- ECharts instance, ribbons, locale tooltip, resize/disposal: `www/app.js`.
 - Layout, colors, breakpoints, modal grid: `www/app.css`.
 
 Keep the browser bundle local and retain third-party license/notice files. When adding HTML-bearing
@@ -832,32 +921,35 @@ as necessary. The dashboard currently requires exactly twelve baseline months.
 
 ### Change telemetry
 
-Add the event at the call site in `app.py` and test both its usefulness and privacy properties. Do
+Add the event at the call site in `src/us_bvar/dashboard.py` and test both its usefulness and privacy properties. Do
 not add scenario values, entered months, identities, raw errors, IP addresses, or credentials.
 
 ## Troubleshooting
 
 ### Startup says the precomputed forecast is missing
 
-Run `uv run python scripts/precompute.py`, or restore all checked-in artifact files. The expected
-path is fixed relative to `app.py`.
+Run `uv run python scripts/precompute.py`, or restore one complete release directory and its
+`artifacts/active.json` pointer. The expected paths are fixed relative to `app.py`; the checked-in
+root artifact is only the migration fallback.
 
 ### Startup reports a checksum or schema failure
 
-The pickle and sidecar may come from different refreshes, the artifact may be corrupt, or code may
-expect another schema. Regenerate and deploy `bvar_forecast.pkl`, its `.sha256`, and metadata as a
-matched set. Do not bypass the check.
+The active release files may come from different refreshes, the artifact may be corrupt, or code may
+expect another schema. Run `uv run python scripts/precompute.py` to stage and validate a complete release,
+then atomically update `artifacts/active.json`. If restoring manually, deploy the matching panel, pickle,
+checksum, metadata, and active manifest from one release directory. Do not bypass the check.
 
 ### Precompute asks for a FRED key
 
-Set `FRED_API_KEY` in `.env`, or use `--offline` only after all five valid per-series cache CSVs exist.
+Set `FRED_API_KEY` in `.env`, or use `--offline` only after all 22 valid per-series cache CSVs exist.
 The checked-in `data/fred_panel.csv` is an output/audit file; it is not the input used by offline
 precompute.
 
-### The panel ends earlier than one recently updated series
+### Series have different endpoints
 
-Expected: the inner join ends at the latest month shared by every series. Inspect each FRED release
-or cached CSV to find the lagging series.
+Expected: the panel calendar ends at the newest monthly release, while each column preserves its
+own endpoint. Inspect `metadata.json::last_observations`; the Kalman filter handles missing releases
+at the ragged edge. Quarterly GDP normally trails the latest monthly indicators.
 
 ### A scenario value is rejected
 
@@ -889,16 +981,17 @@ independent. Verify which control owns the component before treating this as a r
 References use repository-relative paths and stable symbols rather than line numbers.
 
 | Concern | File | Key symbols |
-|---|---|---|
-| Application constants/startup | `app.py` | `ARTIFACT`, `MODEL`, `BASELINE`, `HISTORY`, `MAX_SCENARIO_CONCURRENCY` |
-| UI composition | `app.py` | `app_ui`, `chart_cards()`, `scenario_modal()`, `_scenario_row()` |
-| Browser integration | `app.py` | `browser_bootstrap()` |
-| Session reactivity | `app.py` | `server()`, `_scenario_task()`, `_run_scenario()`, `_handle_scenario_result()` |
-| Scenario memoization | `app.py` | `_constraint_key()`, `_cached_scenario_forecast()` |
-| Health/security | `app.py` | `_health()`, `SecurityHeadersMiddleware`, `app` |
+| --- | --- | --- |
+| Application factory/runtime | `src/us_bvar/dashboard.py` | `DashboardRuntime`, `create_runtime()`, `create_app()` |
+| UI composition | `src/us_bvar/dashboard.py` | `build_ui()`, `chart_cards()`, `scenario_modal()`, `_scenario_row()` |
+| Browser integration | `www/app.js` | chart lifecycle and scenario editor bootstrap |
+| Session reactivity | `src/us_bvar/dashboard.py` | `server()`, `_scenario_task()`, `_run_scenario()`, `_handle_scenario_result()` |
+| Scenario memoization | `src/us_bvar/dashboard.py` | `_constraint_key()`, `_cached_scenario_forecast()` |
+| Health/security | `src/us_bvar/dashboard.py` | `_health()`, `SecurityHeadersMiddleware`, `DashboardRuntime.app` |
 | Series registry | `src/us_bvar/config.py` | `SeriesSpec`, `SERIES_SPECS`, `SERIES_BY_ID` |
 | Pandemic controls | `src/us_bvar/config.py` | `PANDEMIC_CONTROL_MONTHS` |
 | FRED/caching | `src/us_bvar/data.py` | `FREDClient`, `fetch_series()`, `fetch_panel()`, `PanelData` |
+| Kalman state space | `src/us_bvar/state_space.py` | `kalman_filter()`, `simulation_smoother()`, `observation_system()` |
 | Model encoding | `src/us_bvar/transforms.py` | `LevelTransformer` |
 | Display transformations | `src/us_bvar/transforms.py` | `PLOT_TRANSFORMATIONS`, `transform_path()`, `transform_forecast_samples()` |
 | Scenario values | `src/us_bvar/transforms.py` | `ScenarioConstraint`, `transformation_spec()` |
@@ -906,11 +999,11 @@ References use repository-relative paths and stable symbols rather than line num
 | Forecast mechanics | `src/us_bvar/model.py` | `BVAR.forecast()`, `_joint_forecast_moments()`, `_draw_parameters()` |
 | Conditional system | `src/us_bvar/model.py` | `_constraint_system()`, `_conditional_sample()` |
 | Result contract | `src/us_bvar/model.py` | `ForecastResult` |
-| Artifact lifecycle | `src/us_bvar/artifact.py` | `ForecastArtifact`, `save_artifact()`, `load_artifact()`, `_validate_artifact()` |
+| Artifact lifecycle | `src/us_bvar/artifact.py` | `ForecastArtifact`, `save_artifact()`, `load_artifact()`, `load_published_release()`, `activate_release()`, `_validate_artifact()` |
 | Chart/table output | `src/us_bvar/presentation.py` | `echarts_options()`, `forecast_gt()`, `forecast_summary_on_scale()` |
 | Units/formatting | `src/us_bvar/presentation.py` | `plot_units()`, `_forecast_table_frame()` |
 | Telemetry | `src/us_bvar/telemetry.py` | `telemetry_enabled()`, `event()` |
-| Refresh orchestration | `scripts/precompute.py` | `parse_args()`, `main()` |
+| Refresh orchestration | `scripts/precompute.py` | `parse_args()`, `main()`, `history_semantics_metadata()` |
 | CML environment | `scripts/setup_cml.py` | `main()` |
 | CML process launch | `cml_entry.py` | `_application_port()`, `main()` |
 | Visual system | `www/app.css` | CSS variables, chart grid, scenario matrix, responsive media queries |
@@ -918,10 +1011,12 @@ References use repository-relative paths and stable symbols rather than line num
 ## Glossary
 
 | Term | Meaning in this repository |
-|---|---|
-| Actual/history | Observed natural-unit values stored with the fitted model |
-| Artifact | Versioned pickle containing the fitted model and baseline forecast |
-| Balanced panel | Only months with a valid observation for every model series |
+| --- | --- |
+| History | Fixed displayed smoothed monthly state history; GDP is estimated between quarterly releases |
+| Historical-state uncertainty | Not drawn for early growth anchors; terminal-state uncertainty remains paired with forecast dynamics |
+| Artifact | Versioned pickle containing the fitted mixed-frequency model and baseline forecast |
+| Ragged panel | Monthly calendar retaining source-specific missing observations and endpoints |
+| Latent monthly GDP | Monthly GDP state inferred jointly from quarterly GDP and monthly indicators |
 | Baseline | Unconditional posterior predictive forecast generated at precompute time |
 | Condition/constraint | An exact user-specified future level or change relationship |
 | Draw/path | One simulated set of all variables across the full forecast horizon |

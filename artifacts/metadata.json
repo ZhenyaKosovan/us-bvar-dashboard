@@ -1,21 +1,317 @@
 {
-  "schema_version": 3,
-  "created_at": "2026-07-10T19:14:26.597274+00:00",
-  "panel_start": "2007-01-01",
-  "panel_end": "2026-05-01",
-  "observation_count": 232,
-  "forecast_start": "2026-06-01",
-  "forecast_end": "2027-05-01",
+  "schema_version": 5,
+  "created_at": "2026-07-16T21:29:32.493106+00:00",
+  "panel_start": "2009-11-01",
+  "panel_end": "2026-07-01",
+  "observation_count": 201,
+  "variable_count": 22,
+  "forecast_start": "2026-08-01",
+  "forecast_end": "2027-07-01",
   "posterior_draws": 400,
   "posterior_interval_quantiles": [
     0.16,
     0.84
   ],
+  "retained_parameter_draws": 200,
+  "retention_attempts": 200,
+  "unstable_draws_rejected": 0,
+  "unstable_draw_fraction": 0.0,
+  "retained_draws_per_chain": [
+    100,
+    100
+  ],
+  "mcmc_diagnostics": {
+    "accepted": true,
+    "chains": 2,
+    "retained_draws_per_chain": [
+      100,
+      100
+    ],
+    "maximum_r_hat": 1.0770385132103777,
+    "minimum_effective_sample_size": 50.37315432868714,
+    "log_likelihood": {
+      "r_hat": 1.0154486221110053,
+      "effective_sample_size": 190.65358106977035,
+      "minimum": 5241.701503118724,
+      "median": 5294.840449999004,
+      "maximum": 5349.378400389641
+    },
+    "companion_radius": {
+      "r_hat": 1.0018816609515753,
+      "effective_sample_size": 200.0,
+      "minimum": 0.9424229706685586,
+      "median": 0.9653666359519663,
+      "maximum": 0.9790128125411184
+    },
+    "transition_coefficients": {
+      "dimensions_checked": 1958,
+      "maximum_r_hat": 1.057358831338028,
+      "maximum_r_hat_flat_index": 278,
+      "r_hat_99th_percentile": 1.0359334158517446,
+      "minimum_effective_sample_size": 78.77083779892271,
+      "minimum_ess_flat_index": 628,
+      "effective_sample_size_1st_percentile": 124.4950240606966
+    },
+    "fixed_pandemic_control_coefficients": {
+      "dimensions_checked": 132,
+      "maximum_r_hat": 1.0,
+      "maximum_r_hat_flat_index": 0,
+      "r_hat_99th_percentile": 1.0,
+      "minimum_effective_sample_size": 200.0,
+      "minimum_ess_flat_index": 0,
+      "effective_sample_size_1st_percentile": 200.0
+    },
+    "innovation_covariances": {
+      "dimensions_checked": 484,
+      "maximum_r_hat": 1.1309614462654343,
+      "maximum_r_hat_flat_index": 8,
+      "r_hat_99th_percentile": 1.0770385132103777,
+      "minimum_effective_sample_size": 39.16750993961462,
+      "minimum_ess_flat_index": 13,
+      "effective_sample_size_1st_percentile": 50.37315432868714
+    },
+    "terminal_states": {
+      "dimensions_checked": 88,
+      "maximum_r_hat": 1.0456993443543479,
+      "maximum_r_hat_flat_index": 22,
+      "r_hat_99th_percentile": 1.0442470850386725,
+      "minimum_effective_sample_size": 80.56409413243625,
+      "minimum_ess_flat_index": 66,
+      "effective_sample_size_1st_percentile": 89.0685994243566
+    },
+    "latent_state_paths": {
+      "dimensions_checked": 4422,
+      "maximum_r_hat": 1.3977237503145197,
+      "maximum_r_hat_flat_index": 2816,
+      "r_hat_99th_percentile": 1.0613118483061303,
+      "minimum_effective_sample_size": 18.256612616259066,
+      "minimum_ess_flat_index": 2794,
+      "effective_sample_size_1st_percentile": 87.16459730063129
+    },
+    "release_thresholds": {
+      "maximum_rank_normalized_split_r_hat": 1.1,
+      "minimum_effective_sample_size": 20.0,
+      "minimum_retained_draws_per_chain": 20,
+      "maximum_companion_radius": 1.1,
+      "maximum_unstable_draw_fraction": 0.25
+    }
+  },
+  "observed_counts": {
+    "GDPC1": 66,
+    "PCEC96": 199,
+    "CPIAUCSL": 199,
+    "UNRATE": 199,
+    "FEDFUNDS": 200,
+    "INDPRO": 199,
+    "RRSFS": 199,
+    "CMRMTSPL": 198,
+    "HOUST": 199,
+    "PERMIT": 199,
+    "DGORDER": 199,
+    "PAYEMS": 200,
+    "CIVPART": 199,
+    "AWHAETP": 200,
+    "CES0500000003": 200,
+    "CPILFESL": 199,
+    "PCEPI": 199,
+    "PCEPILFE": 199,
+    "PPIFIS": 200,
+    "GS10": 200,
+    "BAA10Y": 201,
+    "M2SL": 199
+  },
+  "series": [
+    {
+      "series_id": "GDPC1",
+      "label": "Real GDP (latent monthly estimate)",
+      "group": "Activity",
+      "frequency": "quarterly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PCEC96",
+      "label": "Real personal consumption expenditures",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "CPIAUCSL",
+      "label": "Consumer Price Index",
+      "group": "Prices",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "UNRATE",
+      "label": "Unemployment rate",
+      "group": "Labor",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "FEDFUNDS",
+      "label": "Effective federal funds rate",
+      "group": "Financial",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "INDPRO",
+      "label": "Industrial production",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "RRSFS",
+      "label": "Real retail and food services sales",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "CMRMTSPL",
+      "label": "Real manufacturing and trade industries sales",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "HOUST",
+      "label": "Housing starts",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PERMIT",
+      "label": "Building permits",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "DGORDER",
+      "label": "Manufacturers' new orders: durable goods",
+      "group": "Activity",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PAYEMS",
+      "label": "All employees: total nonfarm payrolls",
+      "group": "Labor",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "CIVPART",
+      "label": "Labor force participation rate",
+      "group": "Labor",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "AWHAETP",
+      "label": "Average weekly hours of all private employees",
+      "group": "Labor",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "CES0500000003",
+      "label": "Average hourly earnings of all private employees",
+      "group": "Labor",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "CPILFESL",
+      "label": "Consumer Price Index excluding food and energy",
+      "group": "Prices",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PCEPI",
+      "label": "Personal consumption expenditures price index",
+      "group": "Prices",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PCEPILFE",
+      "label": "PCE price index excluding food and energy",
+      "group": "Prices",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "PPIFIS",
+      "label": "Producer Price Index: final demand",
+      "group": "Prices",
+      "frequency": "monthly",
+      "model_transform": "log"
+    },
+    {
+      "series_id": "GS10",
+      "label": "10-year Treasury constant maturity rate",
+      "group": "Financial",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "BAA10Y",
+      "label": "Moody's Baa corporate bond yield relative to 10-year Treasury",
+      "group": "Financial",
+      "frequency": "monthly",
+      "model_transform": "level"
+    },
+    {
+      "series_id": "M2SL",
+      "label": "M2 money stock",
+      "group": "Financial",
+      "frequency": "monthly",
+      "model_transform": "log"
+    }
+  ],
+  "last_observations": {
+    "GDPC1": "2026-03-01",
+    "PCEC96": "2026-05-01",
+    "CPIAUCSL": "2026-06-01",
+    "UNRATE": "2026-06-01",
+    "FEDFUNDS": "2026-06-01",
+    "INDPRO": "2026-05-01",
+    "RRSFS": "2026-06-01",
+    "CMRMTSPL": "2026-04-01",
+    "HOUST": "2026-05-01",
+    "PERMIT": "2026-05-01",
+    "DGORDER": "2026-05-01",
+    "PAYEMS": "2026-06-01",
+    "CIVPART": "2026-06-01",
+    "AWHAETP": "2026-06-01",
+    "CES0500000003": "2026-06-01",
+    "CPILFESL": "2026-06-01",
+    "PCEPI": "2026-05-01",
+    "PCEPILFE": "2026-05-01",
+    "PPIFIS": "2026-06-01",
+    "GS10": "2026-06-01",
+    "BAA10Y": "2026-07-01",
+    "M2SL": "2026-05-01"
+  },
+  "mixed_frequency": {
+    "latent_frequency": "monthly",
+    "quarterly_series": "GDPC1",
+    "aggregation": "one-third mean of three standardized monthly log levels",
+    "filter": "Kalman",
+    "smoother": "forward-filter backward-sample"
+  },
   "model_config": {
     "lags": 4,
-    "tightness": 0.2,
-    "cross_variable_tightness": 0.5,
+    "tightness": 0.02,
     "lag_decay": 1.0,
+    "own_lag_prior_mean": 0.9,
     "pandemic_months": [
       "2020-03-01",
       "2020-04-01",
@@ -27,9 +323,47 @@
     "interval": [
       0.16,
       0.84
-    ]
+    ],
+    "mcmc_iterations": 600,
+    "burn_in": 300,
+    "thin": 3,
+    "mcmc_chains": 2,
+    "estimation_seed": 202504,
+    "monthly_measurement_variance": 1e-06,
+    "quarterly_measurement_variance": 0.0001,
+    "diffuse_state_variance": 10.0,
+    "max_companion_radius": 1.1,
+    "maximum_unstable_draw_fraction": 0.25,
+    "maximum_mcmc_r_hat": 1.1,
+    "minimum_mcmc_effective_sample_size": 20.0,
+    "minimum_component_effective_sample_size": 1.0,
+    "minimum_component_effective_fraction": 0.05
   },
   "source": "FRED API cache",
-  "panel_sha256": "7e10b08943739165bc40e864b36408a2a0dc08e31354aa354cdacefc405f747a",
-  "artifact_sha256": "282d8a408487a5a7a5d14a4f56947d1d71107470b61529cee839a7cd7699cdfe"
+  "source_by_series": {
+    "GDPC1": "cache",
+    "PCEC96": "cache",
+    "CPIAUCSL": "cache",
+    "UNRATE": "cache",
+    "FEDFUNDS": "cache",
+    "INDPRO": "cache",
+    "RRSFS": "cache",
+    "CMRMTSPL": "cache",
+    "HOUST": "cache",
+    "PERMIT": "cache",
+    "DGORDER": "cache",
+    "PAYEMS": "cache",
+    "CIVPART": "cache",
+    "AWHAETP": "cache",
+    "CES0500000003": "cache",
+    "CPILFESL": "cache",
+    "PCEPI": "cache",
+    "PCEPILFE": "cache",
+    "PPIFIS": "cache",
+    "GS10": "cache",
+    "BAA10Y": "cache",
+    "M2SL": "cache"
+  },
+  "panel_sha256": "ccbfbed173deb2b3b084aa2f3a39ad23f5d3cc9f2fc451fcf828e2ea486a0f74",
+  "artifact_sha256": "e5171873d7f4dfdb45169a0d651e9e2b0e99f782749cd4e0fb4325831da4cee4"
 }

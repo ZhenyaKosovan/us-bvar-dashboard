@@ -1,4 +1,4 @@
-"""Monthly US Bayesian VAR and conditional forecast utilities."""
+"""Mixed-frequency US Bayesian VAR and conditional forecast utilities."""
 
 from us_bvar.config import SERIES_SPECS, SeriesSpec
 from us_bvar.model import BVAR, BVARConfig, ForecastResult

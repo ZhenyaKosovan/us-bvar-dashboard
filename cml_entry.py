@@ -30,10 +30,20 @@ def main() -> None:
         raise SystemExit(
             "CML environment not found. Run `python scripts/setup_cml.py` in this project first."
         )
+    active_pointer = ROOT / "artifacts/active.json"
+    if active_pointer.is_file():
+        model_files = (active_pointer,)
+    else:
+        # Migration fallback: the original checked-in artifact remains deployable
+        # until a release pointer is shipped with its staged release directory.
+        model_files = (
+            ROOT / "artifacts/bvar_forecast.pkl",
+            ROOT / "artifacts/bvar_forecast.pkl.sha256",
+        )
     required_files = (
-        ROOT / "artifacts/bvar_forecast.pkl",
-        ROOT / "artifacts/bvar_forecast.pkl.sha256",
+        *model_files,
         ROOT / "www/vendor/echarts/echarts.min.js",
+        ROOT / "www/app.js",
     )
     missing = [str(path.relative_to(ROOT)) for path in required_files if not path.is_file()]
     if missing:
