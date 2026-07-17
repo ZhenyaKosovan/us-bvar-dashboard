@@ -433,9 +433,10 @@ validation error. Values must be finite and cannot exceed one billion in absolut
 2. A reactive full-page scenario progress output.
 3. A masthead showing the application name and artifact vintage/build time.
 4. A status bar showing sample/draw/horizon metadata and scenario controls.
-5. A searchable variable workspace capped at eight visible series.
-6. Chart cards and a Great Tables forecast table driven by the same working set.
-7. A compact method/risk note.
+5. A searchable chart library and preset-driven analysis canvas capped at eight visible series.
+6. An arrangeable, resizable chart matrix with click, keyboard, and drag interactions.
+7. A collapsed-on-load Great Tables forecast data disclosure driven by the same working set.
+8. A compact method/risk disclosure and footer note.
 
 The order of `SERIES_SPECS` is a contract used throughout the model, artifact, UI, and table. It is
 also the variable order inside NumPy arrays.
@@ -460,9 +461,19 @@ Chart and scenario row selectors are independent. Selecting “YoY” on a chart
 scenario editor, and selecting “QoQ” in the editor does not change a chart. This is intentional: one
 controls display, the other controls the interpretation of assumptions.
 
+The left chart library can be searched by label or FRED ID and filtered by macro group. Users may
+click Add or drag a library row into the matrix. Existing cards have a dedicated drag handle; a
+compact options menu provides accessible Move earlier/later actions, Standard/Wide/Tall/Focus sizes,
+and removal without crowding the chart header. Overview, Inflation & policy, and Growth & labor
+presets replace the current working set through the same ordered Shiny input used by
+the table. Selection order, card dimensions, and chart transformations are stored under a versioned
+browser `localStorage` key. Restored IDs are deduplicated, checked against the current 22-series
+library, and capped at eight before they reach Shiny.
+
 ### Forecast table
 
-The table always uses natural levels; chart selectors do not affect it. It follows the current
+The table always uses natural levels; chart selectors do not affect it. It is presented in a native
+collapsed disclosure so it remains available without dominating the canvas. It follows the current
 variable workspace selection and contains six actual rows
 and twelve forecast rows. Each forecast cell shows the median and its configured pointwise percentile
 interval. With a scenario active, each variable spanner gains separate Baseline and Scenario
@@ -524,9 +535,12 @@ fails while an older scenario is active, the older applied result remains in ses
 `www/app.css` defines the dark visual system, spacing, table styles, modal grid, focus states, and
 breakpoints.
 
-- Above 900 px, charts use two columns.
-- Below 900 px, the masthead/status sections stack and charts use one column.
-- Below 560 px, padding and chart height reduce and chart controls stack.
+- Wide screens use a 12-column matrix: standard cards span six columns and expanded cards span all
+  twelve. Below 1250 px, cards use the full canvas width.
+- Below 900 px, the masthead/status sections stack, the sticky chart library moves above the canvas,
+  and its rows use a compact two-column list.
+- Below 560 px, the library and charts use one column, padding and chart height reduce, and chart
+  controls stack.
 - The scenario matrix keeps its 1600 px minimum layout inside a two-axis scroll container rather
   than collapsing cells.
 - Chart resize observers follow their containers rather than assuming viewport width.

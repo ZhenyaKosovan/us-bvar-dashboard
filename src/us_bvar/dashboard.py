@@ -22,7 +22,7 @@ from shiny import (  # type: ignore[import-not-found]
 )
 from starlette.requests import Request  # type: ignore[import-not-found]
 from starlette.responses import JSONResponse  # type: ignore[import-not-found]
-from starlette.routing import Route
+from starlette.routing import Route  # type: ignore[import-not-found]
 
 from us_bvar.artifact import ForecastArtifact, PublishedRelease, load_published_release
 from us_bvar.config import (
@@ -116,15 +116,153 @@ def browser_bootstrap() -> ui.Tag:
     return ui.tags.script(src="app.js")
 
 
+WORKSPACE_PRESETS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("Overview", "A balanced view of activity, prices, labor, and rates", DEFAULT_DASHBOARD_SERIES),
+    (
+        "Inflation & policy",
+        "Headline and core inflation alongside policy and market rates",
+        ("CPIAUCSL", "CPILFESL", "PCEPI", "PCEPILFE", "FEDFUNDS", "GS10"),
+    ),
+    (
+        "Growth & labor",
+        "Output, spending, production, payrolls, and unemployment",
+        ("GDPC1", "PCEC96", "INDPRO", "RRSFS", "PAYEMS", "UNRATE"),
+    ),
+)
+
+
+def _sparkline(runtime, spec: SeriesSpec) -> Any:
+    history = cast(pd.Series, runtime.history[spec.series_id])
+    numeric_history = cast(pd.Series, pd.to_numeric(history, errors="coerce"))
+    values = numeric_history.dropna().tail(18).tolist()
+    if len(values) < 2:
+        return ui.span(class_="library-sparkline-placeholder", aria_hidden="true")
+    low, high = min(values), max(values)
+    spread = high - low or 1.0
+    points = " ".join(
+        f"{index * 88 / (len(values) - 1):.1f},{22 - ((value - low) / spread) * 18:.1f}"
+        for index, value in enumerate(values)
+    )
+    return ui.HTML(
+        '<svg class="library-sparkline" viewBox="0 0 88 26" aria-hidden="true" '
+        'focusable="false"><polyline points="'
+        f"{points}"
+        '" vector-effect="non-scaling-stroke"></polyline></svg>'
+    )
+
+
+def variable_library(runtime) -> ui.Tag:
+    items: list[ui.Tag] = []
+    for spec in SERIES_SPECS:
+        add_button = ui.tags.button(
+            ui.span("+", aria_hidden="true"),
+            ui.span(f"Add {spec.short_label}", class_="visually-hidden"),
+            type="button",
+            class_="variable-add-button",
+            title=f"Add {spec.short_label} to the canvas",
+        )
+        add_button.attrs["data-series-id"] = spec.series_id
+        item = ui.div(
+            ui.div(
+                ui.div(spec.short_label, class_="library-item-label", title=spec.label),
+                ui.div(f"{spec.series_id} · {spec.group}", class_="library-item-meta"),
+                class_="library-item-copy",
+            ),
+            _sparkline(runtime, spec),
+            add_button,
+            class_="variable-library-item",
+        )
+        item.attrs.update(
+            {
+                "draggable": "true",
+                "data-series-id": spec.series_id,
+                "data-series-group": spec.group,
+                "data-series-search": (
+                    f"{spec.series_id} {spec.short_label} {spec.label} {spec.group}".lower()
+                ),
+            }
+        )
+        items.append(item)
+    return ui.div(*items, class_="variable-library-list", id="variable-library-list")
+
+
+def _card_action(
+    symbol: str, label: str, class_name: str, spec: SeriesSpec, *, pressed: bool | None = None
+) -> ui.Tag:
+    button = ui.tags.button(
+        ui.span(symbol, aria_hidden="true"),
+        ui.span(f"{label} {spec.short_label}", class_="visually-hidden"),
+        type="button",
+        class_=f"chart-action {class_name}",
+        title=f"{label} {spec.short_label}",
+    )
+    if pressed is not None:
+        button.attrs["aria-pressed"] = str(pressed).lower()
+    button.attrs["data-series-id"] = spec.series_id
+    return button
+
+
+def _chart_menu_option(
+    label: str, class_name: str, spec: SeriesSpec, *, size: str | None = None
+) -> ui.Tag:
+    button = ui.tags.button(
+        label,
+        type="button",
+        class_=f"chart-menu-option {class_name}",
+        role="menuitemradio" if size else "menuitem",
+    )
+    button.attrs["data-series-id"] = spec.series_id
+    if size:
+        button.attrs.update(
+            {
+                "data-card-size": size,
+                "aria-checked": str(size == "standard").lower(),
+            }
+        )
+    return button
+
+
 def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[ui.Tag]:
     cards: list[ui.Tag] = []
     for spec in specs:
-        cards.append(
-            ui.tags.article(
+        drag_handle = _card_action("⠿", "Drag", "chart-drag-handle", spec)
+        drag_handle.attrs["draggable"] = "true"
+        chart_menu = ui.tags.details(
+            ui.tags.summary(
+                ui.span("•••", aria_hidden="true"),
+                ui.span(f"Options for {spec.short_label}", class_="visually-hidden"),
+                class_="chart-menu-trigger",
+                title=f"Options for {spec.short_label}",
+            ),
+            ui.div(
+                _chart_menu_option("Move earlier", "chart-move-earlier", spec),
+                _chart_menu_option("Move later", "chart-move-later", spec),
+                ui.div("CARD SIZE", class_="chart-menu-label"),
                 ui.div(
+                    _chart_menu_option("Standard", "chart-size-option", spec, size="standard"),
+                    _chart_menu_option("Wide", "chart-size-option", spec, size="wide"),
+                    _chart_menu_option("Tall", "chart-size-option", spec, size="tall"),
+                    _chart_menu_option("Focus", "chart-size-option", spec, size="focus"),
+                    class_="chart-size-options",
+                ),
+                ui.div(class_="chart-menu-divider"),
+                _chart_menu_option("Remove chart", "chart-remove-button", spec),
+                class_="chart-menu-panel",
+                role="menu",
+            ),
+            class_="chart-menu",
+        )
+        card = ui.tags.article(
+            ui.div(
+                ui.div(
+                    drag_handle,
                     ui.div(
-                        ui.div(spec.short_label.upper(), class_="chart-kicker"), ui.h2(spec.label)
+                        ui.div(spec.short_label.upper(), class_="chart-kicker"),
+                        ui.h2(spec.label),
                     ),
+                    class_="chart-title-group",
+                ),
+                ui.div(
                     ui.div(
                         ui.input_select(
                             f"plot_transform_{spec.series_id}",
@@ -134,17 +272,32 @@ def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[u
                                 for key, transform_spec in PLOT_TRANSFORMATIONS.items()
                             },
                             selected=spec.default_plot_transform,
-                            width="190px",
+                            width="150px",
                         ),
                         class_="chart-transform",
                     ),
-                    class_="chart-heading",
+                    chart_menu,
+                    class_="chart-heading-controls",
                 ),
-                ui.output_ui(f"chart_{spec.series_id}"),
-                class_="chart-card",
-            )
+                class_="chart-heading",
+            ),
+            ui.output_ui(f"chart_{spec.series_id}"),
+            class_="chart-card",
         )
+        card.attrs.update({"data-series-id": spec.series_id, "data-card-size": "standard"})
+        cards.append(card)
     return cards
+
+
+def _preset_buttons() -> list[ui.Tag]:
+    buttons: list[ui.Tag] = []
+    for name, description, series_ids in WORKSPACE_PRESETS:
+        button = ui.tags.button(name, type="button", class_="workspace-preset", title=description)
+        button.attrs.update(
+            {"data-workspace-preset": name, "data-series-ids": json.dumps(series_ids)}
+        )
+        buttons.append(button)
+    return buttons
 
 
 def build_ui(runtime) -> ui.Tag:
@@ -160,41 +313,87 @@ def build_ui(runtime) -> ui.Tag:
         ui.output_ui("scenario_progress"),
         ui.tags.header(
             ui.div(
-                ui.div("US MACRO · MIXED FREQUENCY", class_="eyebrow"),
-                ui.h1("Macro scenario studio", class_="app-title"),
+                ui.div(
+                    ui.div(
+                        ui.span(class_="app-mark-bar"),
+                        ui.span(class_="app-mark-bar"),
+                        ui.span(class_="app-mark-bar"),
+                        class_="app-mark",
+                        aria_hidden="true",
+                    ),
+                    ui.div("US MACRO · MIXED FREQUENCY", class_="eyebrow"),
+                    ui.div(
+                        ui.span(class_="live-dot", aria_hidden="true"),
+                        "Model online",
+                        class_="live-badge",
+                    ),
+                    class_="brand-meta",
+                ),
+                ui.h1(
+                    "Macro scenario ", ui.span("studio", class_="title-accent"), class_="app-title"
+                ),
                 ui.p(
-                    "Explore a 22-variable Bayesian baseline, then shape conditional paths "
-                    "across activity, labor, prices, policy, and financial conditions.",
+                    "Compose a forecast view, then test conditional paths across the US economy.",
                     class_="app-subtitle",
                 ),
                 class_="brand-block",
             ),
             ui.div(
-                ui.div("FORECAST VINTAGE", class_="artifact-kicker"),
-                ui.div(f"Data through {runtime.artifact.panel_end:%B %Y}", class_="artifact-date"),
                 ui.div(
-                    f"Built {runtime.artifact.created_at:%d %b %Y · %H:%M UTC}",
-                    class_="artifact-built",
+                    ui.span("↗", class_="artifact-icon", aria_hidden="true"),
+                    ui.div(
+                        ui.div("FORECAST VINTAGE", class_="artifact-kicker"),
+                        ui.div(
+                            f"Data through {runtime.artifact.panel_end:%B %Y}",
+                            class_="artifact-date",
+                        ),
+                        ui.div(
+                            f"Built {runtime.artifact.created_at:%d %b %Y · %H:%M UTC}",
+                            class_="artifact-built",
+                        ),
+                    ),
+                    class_="artifact-badge-content",
                 ),
+                ui.div("Latest published baseline", class_="artifact-status"),
                 class_="artifact-badge",
             ),
             class_="masthead",
         ),
         ui.tags.section(
             ui.div(
-                ui.div("MODEL READY", class_="status-label"),
                 ui.div(
-                    f"{runtime.artifact.observation_count:,} calendar months · "
-                    f"{len(SERIES_SPECS)} variables · "
-                    f"{runtime.baseline.draws:,} posterior paths · "
-                    f"{FORECAST_HORIZON}-month horizon",
-                    class_="status-detail",
+                    ui.span(class_="status-pulse", aria_hidden="true"),
+                    ui.div("MODEL READY", class_="status-label"),
+                    class_="status-heading",
+                ),
+                ui.div(
+                    ui.div(
+                        ui.strong(f"{runtime.artifact.observation_count:,}"),
+                        ui.span("months"),
+                        class_="model-stat",
+                    ),
+                    ui.div(
+                        ui.strong(str(len(SERIES_SPECS))),
+                        ui.span("variables"),
+                        class_="model-stat",
+                    ),
+                    ui.div(
+                        ui.strong(f"{runtime.baseline.draws:,}"),
+                        ui.span("paths"),
+                        class_="model-stat",
+                    ),
+                    ui.div(
+                        ui.strong(str(FORECAST_HORIZON)),
+                        ui.span("mo horizon"),
+                        class_="model-stat",
+                    ),
+                    class_="model-stats",
                 ),
                 class_="status-copy",
             ),
             ui.div(
                 ui.output_ui("scenario_summary"),
-                ui.input_action_button("open_scenario", "Build a scenario", class_="btn-scenario"),
+                ui.input_action_button("open_scenario", "Build scenario", class_="btn-scenario"),
                 ui.input_action_button(
                     "clear_scenario", "Clear", class_="btn-clear", disabled=True
                 ),
@@ -202,52 +401,134 @@ def build_ui(runtime) -> ui.Tag:
             ),
             class_="status-bar",
         ),
-        ui.div(
-            ui.span("DISPLAY", class_="guidance-label"),
-            "Each chart can show levels or a growth/change rate. GDP history and monthly scenarios "
-            "refer to the latent monthly estimate; official GDPC1 remains quarterly. Early growth "
-            "anchors use this displayed fixed history; paired terminal-state uncertainty still "
-            "drives forecast dynamics.",
-            class_="transform-guidance",
+        ui.tags.details(
+            ui.tags.summary("How to read these forecasts"),
+            ui.p(
+                "Charts can show levels or growth/change rates. GDP history and monthly scenarios "
+                "refer to the latent monthly estimate; official GDPC1 remains quarterly. Early "
+                "growth anchors use displayed fixed history, while paired terminal-state "
+                "uncertainty still drives forecast dynamics. This is not a causal forecast."
+            ),
+            class_="method-disclosure",
         ),
         ui.tags.section(
             ui.div(
-                ui.div("VARIABLE WORKSPACE", class_="guidance-label"),
                 ui.div(
-                    "Choose up to eight series. Search by name or FRED ID; the forecast table "
-                    "follows the same selection.",
-                    class_="variable-browser-copy",
+                    ui.div("ANALYSIS CANVAS", class_="guidance-label"),
+                    ui.h2("Build your forecast view", class_="workspace-title"),
+                    ui.p(
+                        "Drag or add up to eight indicators. Reorder and resize cards to match "
+                        "the question you are exploring.",
+                        class_="workspace-subtitle",
+                    ),
+                    class_="workspace-heading",
                 ),
-                class_="variable-browser-heading",
+                ui.div(
+                    ui.span("START FROM", class_="preset-label"),
+                    ui.div(*_preset_buttons(), class_="workspace-presets"),
+                    class_="preset-group",
+                ),
+                class_="workspace-toolbar",
             ),
-            ui.input_selectize(
-                "visible_variables",
-                "Series shown",
-                choices={
-                    spec.series_id: f"{spec.group} · {spec.short_label} ({spec.series_id})"
-                    for spec in SERIES_SPECS
-                },
-                selected=list(DEFAULT_DASHBOARD_SERIES),
-                multiple=True,
-                width="100%",
-                options={
-                    "plugins": ["remove_button"],
-                    "maxItems": 8,
-                    "closeAfterSelect": True,
-                    "placeholder": "Search 22 model variables",
-                },
+            ui.div(
+                ui.tags.aside(
+                    ui.div(
+                        ui.div("CHART LIBRARY", class_="guidance-label"),
+                        ui.output_ui("variable_selection_summary"),
+                        class_="library-heading",
+                    ),
+                    ui.tags.label(
+                        "Find an indicator",
+                        ui.tags.input(
+                            id="variable-library-search",
+                            type="search",
+                            placeholder="Search name or FRED ID",
+                            autocomplete="off",
+                        ),
+                        class_="library-search-label",
+                    ),
+                    ui.div(
+                        ui.tags.button(
+                            "All",
+                            type="button",
+                            class_="library-filter is-active",
+                            data_group="All",
+                            aria_pressed="true",
+                        ),
+                        *[
+                            ui.tags.button(
+                                group,
+                                type="button",
+                                class_="library-filter",
+                                data_group=group,
+                                aria_pressed="false",
+                            )
+                            for group in SERIES_GROUPS
+                        ],
+                        class_="library-filters",
+                        aria_label="Filter chart library by group",
+                    ),
+                    variable_library(runtime),
+                    ui.div("No indicators match this filter.", class_="library-empty", hidden=True),
+                    class_="variable-library",
+                    aria_label="Available forecast charts",
+                ),
+                ui.div(
+                    ui.div(
+                        ui.div(
+                            ui.span("YOUR MATRIX", class_="canvas-kicker"),
+                            ui.span("Drag cards to rearrange", class_="canvas-hint"),
+                        ),
+                        ui.div(
+                            "Workspace changes are saved in this browser.",
+                            class_="canvas-save-status",
+                        ),
+                        class_="canvas-header",
+                    ),
+                    ui.output_ui("chart_grid"),
+                    class_="workspace-canvas-shell",
+                ),
+                class_="workspace-shell",
             ),
-            ui.output_ui("variable_selection_summary"),
-            class_="variable-browser",
+            ui.div(
+                ui.input_selectize(
+                    "visible_variables",
+                    "Series shown",
+                    choices={
+                        spec.series_id: f"{spec.group} · {spec.short_label} ({spec.series_id})"
+                        for spec in SERIES_SPECS
+                    },
+                    selected=list(DEFAULT_DASHBOARD_SERIES),
+                    multiple=True,
+                    options={"maxItems": 8},
+                ),
+                class_="workspace-selection-control",
+                aria_hidden="true",
+            ),
+            ui.div(
+                "",
+                id="workspace-announcer",
+                class_="visually-hidden",
+                aria_live="polite",
+                aria_atomic="true",
+            ),
+            class_="workspace",
         ),
-        ui.output_ui("chart_grid"),
-        ui.tags.section(ui.output_ui("forecast_table"), class_="table-shell"),
+        ui.tags.details(
+            ui.tags.summary(
+                ui.span("Forecast data", class_="table-disclosure-title"),
+                ui.span(
+                    "History, medians, and uncertainty intervals",
+                    class_="table-disclosure-copy",
+                ),
+            ),
+            ui.tags.section(ui.output_ui("forecast_table"), class_="table-shell"),
+            class_="table-disclosure",
+        ),
         ui.tags.footer(
             "Latent monthly GDP from quarterly GDPC1 · Kalman simulation smoother · "
             "22-variable BVAR · 4 monthly lags · Minnesota prior · "
-            f"pointwise {runtime.forecast_interval_label} · "
-            "fixed displayed history for early growth anchors · paired terminal-state uncertainty "
-            "in forecast dynamics · not a causal forecast",
+            f"pointwise {runtime.forecast_interval_label} · not a causal forecast",
             class_="method-note",
         ),
     )
@@ -483,7 +764,12 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     def _visible_specs() -> tuple[SeriesSpec, ...]:
         raw = input.visible_variables()
         selected = [raw] if isinstance(raw, str) else list(raw or ())
-        valid_ids = [series_id for series_id in selected if series_id in SERIES_BY_ID][:8]
+        valid_ids: list[str] = []
+        for series_id in selected:
+            if series_id in SERIES_BY_ID and series_id not in valid_ids:
+                valid_ids.append(series_id)
+            if len(valid_ids) == 8:
+                break
         if not valid_ids:
             valid_ids = [DEFAULT_DASHBOARD_SERIES[0]]
         return tuple(SERIES_BY_ID[series_id] for series_id in valid_ids)
@@ -501,7 +787,14 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     @output
     @render.ui
     def chart_grid() -> ui.Tag:
-        return ui.tags.main(*chart_cards(runtime, _visible_specs()), class_="chart-grid")
+        grid = ui.div(*chart_cards(runtime, _visible_specs()), class_="chart-grid")
+        grid.attrs.update(
+            {
+                "id": "workspace-canvas",
+                "aria-label": "Arrangeable forecast chart matrix",
+            }
+        )
+        return grid
 
     @output
     @render.ui

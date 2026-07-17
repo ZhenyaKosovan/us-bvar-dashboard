@@ -5,12 +5,17 @@ import json
 from pathlib import Path
 from typing import cast
 
-import httpx
+import httpx  # type: ignore[import-not-found]
 import pytest
 
 from us_bvar.artifact import ForecastArtifact
 from us_bvar.config import SERIES_SPECS
-from us_bvar.dashboard import DashboardRuntime, _cached_scenario_forecast, scenario_modal
+from us_bvar.dashboard import (
+    DashboardRuntime,
+    _cached_scenario_forecast,
+    chart_cards,
+    scenario_modal,
+)
 from us_bvar.transforms import ScenarioConstraint
 
 
@@ -56,8 +61,33 @@ def test_browser_bootstrap_is_served_as_a_local_static_module(
     assert browser_script.headers["content-type"].startswith("text/javascript")
     assert "DOMContentLoaded" in browser_script.text
     assert "MutationObserver" in browser_script.text
+    assert "us-bvar-workspace-v1" in browser_script.text
+    assert "dragstart" in browser_script.text
+    assert "localStorage" in browser_script.text
     assert echarts_bundle.status_code == 200
     assert len(echarts_bundle.content) > 100_000
+
+
+def test_generated_ui_contains_accessible_workspace_builder(
+    dashboard_runtime: DashboardRuntime,
+) -> None:
+    rendered = str(dashboard_runtime.ui)
+    cards_html = "".join(str(card) for card in chart_cards(dashboard_runtime, SERIES_SPECS[:2]))
+
+    assert 'id="variable-library-search"' in rendered
+    assert 'id="variable-library-list"' in rendered
+    assert rendered.count('class="variable-library-item"') == len(SERIES_SPECS)
+    assert rendered.count('class="variable-add-button"') == len(SERIES_SPECS)
+    assert 'data-workspace-preset="Overview"' in rendered
+    assert 'id="workspace-announcer"' in rendered
+    assert 'aria-live="polite"' in rendered
+    assert 'class="workspace-selection-control"' in rendered
+    assert cards_html.count('class="chart-card"') == 2
+    assert cards_html.count('class="chart-action chart-drag-handle"') == 2
+    assert cards_html.count('class="chart-menu"') == 2
+    assert cards_html.count('class="chart-menu-option chart-remove-button"') == 2
+    assert cards_html.count('role="menu"') == 2
+    assert cards_html.count('aria-checked="true"') == 2
 
 
 def test_scenario_modal_generated_output_is_accessible(dashboard_runtime: DashboardRuntime) -> None:
