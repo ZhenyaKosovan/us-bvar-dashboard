@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
-from functools import lru_cache
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from secrets import token_hex
 from time import perf_counter
@@ -40,6 +43,10 @@ from us_bvar.presentation import (
     interval_label,
     plot_units,
 )
+from us_bvar.scenario_service import (  # pyright: ignore[reportMissingImports]
+    ConstraintKey,
+    ScenarioForecastService,
+)
 from us_bvar.telemetry import event as telemetry_event
 from us_bvar.transforms import (
     PLOT_TRANSFORMATIONS,
@@ -52,6 +59,110 @@ ROOT = Path(__file__).resolve().parents[2]
 FORECAST_HORIZON = 12
 POSTERIOR_DRAWS = 400
 SCENARIO_CACHE_SIZE = 32
+MAX_SCENARIO_NAME_LENGTH = 60
+MAX_SCENARIO_CONSTRAINTS = 60
+MAX_SCENARIO_VALUE = 1_000_000_000.0
+SCENARIO_NUMBER_PATTERN = re.compile(
+    r"^[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NamedScenario:
+    """A session-local saved scenario with a stable UI identifier."""
+
+    scenario_id: str
+    name: str
+    forecast: ForecastResult
+
+
+def normalize_scenario_name(raw_name: object) -> str:
+    """Return a compact display name or raise a user-facing validation error."""
+
+    name = " ".join(str(raw_name or "").split())
+    if not name:
+        raise ValueError("Give this scenario a name.")
+    if len(name) > MAX_SCENARIO_NAME_LENGTH:
+        raise ValueError(f"Scenario names must be {MAX_SCENARIO_NAME_LENGTH} characters or fewer.")
+    if not all(character.isprintable() for character in name):
+        raise ValueError("Scenario names cannot contain control characters.")
+    return name
+
+
+def parse_scenario_value(raw_value: object) -> float:
+    """Parse an unambiguous finite scenario number with optional grouped thousands."""
+
+    text = str(raw_value).strip()
+    if not SCENARIO_NUMBER_PATTERN.fullmatch(text):
+        raise ValueError("Scenario values must be valid numbers.")
+    try:
+        value = float(text.replace(",", ""))
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("Scenario values must be valid numbers.") from exc
+    if not math.isfinite(value):
+        raise ValueError("Scenario values must be finite.")
+    if abs(value) > MAX_SCENARIO_VALUE:
+        raise ValueError("Scenario values cannot exceed one billion in absolute magnitude.")
+    return value
+
+
+def default_scenario_name(
+    scenarios: Mapping[str, NamedScenario], start_number: int
+) -> tuple[str, int]:
+    """Return the next available sequential scenario name and its number."""
+
+    number = max(1, start_number)
+    existing_names = {scenario.name.casefold() for scenario in scenarios.values()}
+    while f"Scenario {number}".casefold() in existing_names:
+        number += 1
+    return f"Scenario {number}", number
+
+
+def duplicate_scenario_name(scenarios: Mapping[str, NamedScenario], original_name: str) -> str:
+    """Return a unique copy name that stays within the UI and server length limit."""
+
+    existing_names = {scenario.name.casefold() for scenario in scenarios.values()}
+    copy_number = 1
+    while True:
+        suffix = " copy" if copy_number == 1 else f" copy {copy_number}"
+        prefix = original_name[: MAX_SCENARIO_NAME_LENGTH - len(suffix)].rstrip()
+        candidate = f"{prefix}{suffix}"
+        if candidate.casefold() not in existing_names:
+            return candidate
+        copy_number += 1
+
+
+def validate_scenario_name(
+    scenarios: Mapping[str, NamedScenario],
+    raw_name: object,
+    *,
+    scenario_id: str | None = None,
+) -> str:
+    """Normalize a name and ensure another saved scenario does not use it."""
+
+    normalized_name = normalize_scenario_name(raw_name)
+    for existing_id, existing in scenarios.items():
+        if existing_id != scenario_id and existing.name.casefold() == normalized_name.casefold():
+            raise ValueError(f'A scenario named "{normalized_name}" already exists.')
+    return normalized_name
+
+
+def save_named_scenario(
+    scenarios: Mapping[str, NamedScenario], scenario: NamedScenario
+) -> dict[str, NamedScenario]:
+    """Add or replace one scenario while enforcing case-insensitive unique names."""
+
+    normalized_name = validate_scenario_name(
+        scenarios, scenario.name, scenario_id=scenario.scenario_id
+    )
+    updated = dict(scenarios)
+    updated[scenario.scenario_id] = NamedScenario(
+        scenario_id=scenario.scenario_id,
+        name=normalized_name,
+        forecast=scenario.forecast,
+    )
+    return updated
+
 
 LOG_LEVEL_NAME = os.getenv("BVAR_LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(
@@ -84,29 +195,12 @@ MAX_SCENARIO_CONCURRENCY = _positive_int_environment(
 )
 
 
-ConstraintKey = tuple[tuple[int, str, float, PlotTransformation], ...]
-
-
 def _constraint_key(constraints: dict[tuple[int, str], ScenarioConstraint]) -> ConstraintKey:
     return tuple(
         sorted(
             (step, series_id, constraint.value, constraint.transformation)
             for (step, series_id), constraint in constraints.items()
         )
-    )
-
-
-@lru_cache(maxsize=SCENARIO_CACHE_SIZE)
-def _cached_scenario_forecast(model, key: ConstraintKey) -> ForecastResult:
-    constraints = {
-        (step, series_id): ScenarioConstraint(value, transformation)
-        for step, series_id, value, transformation in key
-    }
-    return model.forecast(
-        horizon=FORECAST_HORIZON,
-        draws=POSTERIOR_DRAWS,
-        constraints=constraints,
-        seed=202507,
     )
 
 
@@ -203,13 +297,19 @@ def _card_action(
 
 
 def _chart_menu_option(
-    label: str, class_name: str, spec: SeriesSpec, *, size: str | None = None
+    label: str,
+    class_name: str,
+    spec: SeriesSpec,
+    *,
+    size: str | None = None,
+    disabled: bool = False,
 ) -> ui.Tag:
     button = ui.tags.button(
         label,
         type="button",
         class_=f"chart-menu-option {class_name}",
         role="menuitemradio" if size else "menuitem",
+        disabled=disabled,
     )
     button.attrs["data-series-id"] = spec.series_id
     if size:
@@ -224,7 +324,7 @@ def _chart_menu_option(
 
 def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[ui.Tag]:
     cards: list[ui.Tag] = []
-    for spec in specs:
+    for index, spec in enumerate(specs):
         drag_handle = _card_action("⠿", "Drag", "chart-drag-handle", spec)
         drag_handle.attrs["draggable"] = "true"
         chart_menu = ui.tags.details(
@@ -235,18 +335,23 @@ def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[u
                 title=f"Options for {spec.short_label}",
             ),
             ui.div(
-                _chart_menu_option("Move earlier", "chart-move-earlier", spec),
-                _chart_menu_option("Move later", "chart-move-later", spec),
-                ui.div("CARD SIZE", class_="chart-menu-label"),
+                _chart_menu_option("Move earlier", "chart-move-earlier", spec, disabled=index == 0),
+                _chart_menu_option(
+                    "Move later",
+                    "chart-move-later",
+                    spec,
+                    disabled=index == len(specs) - 1,
+                ),
+                ui.div("CARD WIDTH", class_="chart-menu-label"),
                 ui.div(
                     _chart_menu_option("Standard", "chart-size-option", spec, size="standard"),
                     _chart_menu_option("Wide", "chart-size-option", spec, size="wide"),
-                    _chart_menu_option("Tall", "chart-size-option", spec, size="tall"),
-                    _chart_menu_option("Focus", "chart-size-option", spec, size="focus"),
                     class_="chart-size-options",
                 ),
                 ui.div(class_="chart-menu-divider"),
-                _chart_menu_option("Remove chart", "chart-remove-button", spec),
+                _chart_menu_option(
+                    "Remove chart", "chart-remove-button", spec, disabled=len(specs) == 1
+                ),
                 class_="chart-menu-panel",
                 role="menu",
             ),
@@ -272,7 +377,7 @@ def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[u
                                 for key, transform_spec in PLOT_TRANSFORMATIONS.items()
                             },
                             selected=spec.default_plot_transform,
-                            width="150px",
+                            width="135px",
                         ),
                         class_="chart-transform",
                     ),
@@ -284,7 +389,13 @@ def chart_cards(runtime, specs: tuple[SeriesSpec, ...] = SERIES_SPECS) -> list[u
             ui.output_ui(f"chart_{spec.series_id}"),
             class_="chart-card",
         )
-        card.attrs.update({"data-series-id": spec.series_id, "data-card-size": "standard"})
+        card.attrs.update(
+            {
+                "data-series-id": spec.series_id,
+                "data-card-size": "standard",
+                "data-default-transform": spec.default_plot_transform,
+            }
+        )
         cards.append(card)
     return cards
 
@@ -311,54 +422,6 @@ def build_ui(runtime) -> ui.Tag:
             browser_bootstrap(),
         ),
         ui.output_ui("scenario_progress"),
-        ui.tags.header(
-            ui.div(
-                ui.div(
-                    ui.div(
-                        ui.span(class_="app-mark-bar"),
-                        ui.span(class_="app-mark-bar"),
-                        ui.span(class_="app-mark-bar"),
-                        class_="app-mark",
-                        aria_hidden="true",
-                    ),
-                    ui.div("US MACRO · MIXED FREQUENCY", class_="eyebrow"),
-                    ui.div(
-                        ui.span(class_="live-dot", aria_hidden="true"),
-                        "Model online",
-                        class_="live-badge",
-                    ),
-                    class_="brand-meta",
-                ),
-                ui.h1(
-                    "Macro scenario ", ui.span("studio", class_="title-accent"), class_="app-title"
-                ),
-                ui.p(
-                    "Compose a forecast view, then test conditional paths across the US economy.",
-                    class_="app-subtitle",
-                ),
-                class_="brand-block",
-            ),
-            ui.div(
-                ui.div(
-                    ui.span("↗", class_="artifact-icon", aria_hidden="true"),
-                    ui.div(
-                        ui.div("FORECAST VINTAGE", class_="artifact-kicker"),
-                        ui.div(
-                            f"Data through {runtime.artifact.panel_end:%B %Y}",
-                            class_="artifact-date",
-                        ),
-                        ui.div(
-                            f"Built {runtime.artifact.created_at:%d %b %Y · %H:%M UTC}",
-                            class_="artifact-built",
-                        ),
-                    ),
-                    class_="artifact-badge-content",
-                ),
-                ui.div("Latest published baseline", class_="artifact-status"),
-                class_="artifact-badge",
-            ),
-            class_="masthead",
-        ),
         ui.tags.section(
             ui.div(
                 ui.div(
@@ -368,9 +431,9 @@ def build_ui(runtime) -> ui.Tag:
                 ),
                 ui.div(
                     ui.div(
-                        ui.strong(f"{runtime.artifact.observation_count:,}"),
-                        ui.span("months"),
-                        class_="model-stat",
+                        ui.strong(f"{runtime.artifact.panel_end:%b %Y}"),
+                        ui.span("data through"),
+                        class_="model-stat model-vintage",
                     ),
                     ui.div(
                         ui.strong(str(len(SERIES_SPECS))),
@@ -392,53 +455,65 @@ def build_ui(runtime) -> ui.Tag:
                 class_="status-copy",
             ),
             ui.div(
-                ui.output_ui("scenario_summary"),
-                ui.input_action_button("open_scenario", "Build scenario", class_="btn-scenario"),
-                ui.input_action_button(
-                    "clear_scenario", "Clear", class_="btn-clear", disabled=True
+                ui.tags.nav(
+                    ui.tags.a("Series", href="#analysis-workspace"),
+                    ui.tags.a("Forecast data", href="#forecast-data"),
+                    class_="section-navigation",
+                    aria_label="Dashboard sections",
                 ),
-                class_="scenario-actions",
+                ui.div(
+                    ui.output_ui("scenario_summary"),
+                    ui.input_action_button("open_scenario", "New scenario", class_="btn-scenario"),
+                    ui.input_action_button(
+                        "edit_scenario", "Edit", class_="btn-clear", disabled=True
+                    ),
+                    ui.input_action_button(
+                        "duplicate_scenario", "Duplicate", class_="btn-clear", disabled=True
+                    ),
+                    ui.input_action_button(
+                        "delete_scenario", "Delete", class_="btn-clear", disabled=True
+                    ),
+                    class_="scenario-actions",
+                ),
+                class_="status-controls",
             ),
             class_="status-bar",
         ),
-        ui.tags.details(
-            ui.tags.summary("How to read these forecasts"),
-            ui.p(
-                "Charts can show levels or growth/change rates. GDP history and monthly scenarios "
-                "refer to the latent monthly estimate; official GDPC1 remains quarterly. Early "
-                "growth anchors use displayed fixed history, while paired terminal-state "
-                "uncertainty still drives forecast dynamics. This is not a causal forecast."
-            ),
-            class_="method-disclosure",
+        (
+            ui.div(
+                ui.strong("MODEL REFRESH REQUIRED"),
+                ui.span(runtime.release_warning),
+                class_="release-warning",
+                role="alert",
+            )
+            if runtime.release_warning
+            else None
         ),
         ui.tags.section(
             ui.div(
+                ui.span("QUICK START", class_="preset-label"),
                 ui.div(
-                    ui.div("ANALYSIS CANVAS", class_="guidance-label"),
-                    ui.h2("Build your forecast view", class_="workspace-title"),
-                    ui.p(
-                        "Drag or add up to eight indicators. Reorder and resize cards to match "
-                        "the question you are exploring.",
-                        class_="workspace-subtitle",
+                    *_preset_buttons(),
+                    ui.tags.button(
+                        "Reset",
+                        type="button",
+                        class_="workspace-preset workspace-reset",
+                        data_series_ids=json.dumps(DEFAULT_DASHBOARD_SERIES),
+                        title="Restore the default charts, order, widths, and transformations",
                     ),
-                    class_="workspace-heading",
+                    class_="workspace-presets",
                 ),
-                ui.div(
-                    ui.span("START FROM", class_="preset-label"),
-                    ui.div(*_preset_buttons(), class_="workspace-presets"),
-                    class_="preset-group",
-                ),
-                class_="workspace-toolbar",
+                class_="preset-group workspace-quick-start",
             ),
             ui.div(
                 ui.tags.aside(
                     ui.div(
-                        ui.div("CHART LIBRARY", class_="guidance-label"),
+                        ui.div("EXPLORE SERIES", class_="guidance-label"),
                         ui.output_ui("variable_selection_summary"),
                         class_="library-heading",
                     ),
                     ui.tags.label(
-                        "Find an indicator",
+                        "Search and add indicators",
                         ui.tags.input(
                             id="variable-library-search",
                             type="search",
@@ -476,8 +551,8 @@ def build_ui(runtime) -> ui.Tag:
                 ui.div(
                     ui.div(
                         ui.div(
-                            ui.span("YOUR MATRIX", class_="canvas-kicker"),
-                            ui.span("Drag cards to rearrange", class_="canvas-hint"),
+                            ui.span("SELECTED SERIES", class_="canvas-kicker"),
+                            ui.span("Drag to rearrange", class_="canvas-hint"),
                         ),
                         ui.div(
                             "Workspace changes are saved in this browser.",
@@ -485,6 +560,7 @@ def build_ui(runtime) -> ui.Tag:
                         ),
                         class_="canvas-header",
                     ),
+                    ui.output_ui("workspace_legend"),
                     ui.output_ui("chart_grid"),
                     class_="workspace-canvas-shell",
                 ),
@@ -507,12 +583,13 @@ def build_ui(runtime) -> ui.Tag:
             ),
             ui.div(
                 "",
-                id="workspace-announcer",
-                class_="visually-hidden",
+                id="workspace-feedback",
+                class_="workspace-feedback",
                 aria_live="polite",
                 aria_atomic="true",
             ),
             class_="workspace",
+            id="analysis-workspace",
         ),
         ui.tags.details(
             ui.tags.summary(
@@ -524,6 +601,7 @@ def build_ui(runtime) -> ui.Tag:
             ),
             ui.tags.section(ui.output_ui("forecast_table"), class_="table-shell"),
             class_="table-disclosure",
+            id="forecast-data",
         ),
         ui.tags.footer(
             "Latent monthly GDP from quarterly GDPC1 · Kalman simulation smoother · "
@@ -563,7 +641,7 @@ def _scenario_row(
         history_by_scale[transformation] = [
             f"{value:,.{decimals}f}" for value in transformed_history.tail(3)
         ]
-        baseline_by_scale[transformation] = [f"{value:.{decimals}f}" for value in median]
+        baseline_by_scale[transformation] = [f"{value:,.{decimals}f}" for value in median]
 
     transformation_input = ui.input_select(
         f"sc_transform_{spec.series_id}",
@@ -572,9 +650,12 @@ def _scenario_row(
         selected=selected,
         width="100%",
     )
-    cast(ui.Tag, transformation_input.children[1]).attrs.update(
+    transformation_shell = cast(ui.Tag, transformation_input.children[1])
+    transformation_shell.attrs["class"] = "scenario-transform-shell"
+    transformation_select = cast(ui.Tag, transformation_shell.children[0])
+    transformation_select.attrs.update(
         {
-            "class": "form-select scenario-transform",
+            "class": "shiny-input-select form-select scenario-transform",
             "data-series-id": spec.series_id,
         }
     )
@@ -586,6 +667,34 @@ def _scenario_row(
     transformation_cell = ui.div(
         transformation_input,
         ui.div(units_by_scale[selected], class_="scenario-row-units"),
+        ui.div(
+            ui.tags.button(
+                "Hold →",
+                type="button",
+                class_="scenario-row-action",
+                data_row_action="hold",
+                title="Hold the first entered value through later months",
+                aria_label=f"Hold {spec.short_label} from first entered value",
+            ),
+            ui.tags.button(
+                "Ramp ↗",
+                type="button",
+                class_="scenario-row-action",
+                data_row_action="interpolate",
+                title="Interpolate a straight path between two entered endpoints",
+                aria_label=f"Interpolate {spec.short_label} endpoints",
+            ),
+            ui.tags.button(
+                "Clear ×",
+                type="button",
+                class_="scenario-row-action scenario-row-clear",
+                data_row_action="clear",
+                title="Clear all assumptions in this row",
+                aria_label=f"Clear {spec.short_label} assumptions",
+            ),
+            class_="scenario-row-tools",
+            aria_label=f"Path tools for {spec.short_label}",
+        ),
         class_="scenario-transformation-cell",
     )
     cells: list[ui.Tag] = [variable_cell, transformation_cell]
@@ -620,6 +729,8 @@ def _scenario_row(
                 "data-month": f"{date:%B %Y}",
                 "data-placeholders-by-scale": json.dumps(placeholders, separators=(",", ":")),
                 "data-series-label": spec.label,
+                "data-series-short-label": spec.short_label,
+                "data-step": str(step),
                 "inputmode": "decimal",
                 "autocomplete": "off",
             }
@@ -634,12 +745,19 @@ def _scenario_row(
                 f"{spec.series_id} {spec.short_label} {spec.label} {spec.group}".lower()
             ),
             "data-units-by-scale": json.dumps(units_by_scale, separators=(",", ":")),
+            "data-model-transform": spec.transform,
         }
     )
     return row
 
 
-def scenario_modal(runtime, existing: ForecastResult | None) -> ui.Tag:
+def scenario_modal(
+    runtime,
+    existing: ForecastResult | None,
+    *,
+    scenario_name: str = "Scenario 1",
+    editing: bool = False,
+) -> ui.Tag:
     existing_constraints = dict(existing.constraints) if existing else {}
     recent_dates = runtime.history.index[-3:]
     header_cells: list[ui.Tag] = [
@@ -678,18 +796,49 @@ def scenario_modal(runtime, existing: ForecastResult | None) -> ui.Tag:
         ui.div(
             ui.div(
                 ui.div(
-                    "Enter only the values you want to constrain. Empty forecast cells stay "
+                    "Enter only the values you want to constrain, up to "
+                    f"{MAX_SCENARIO_CONSTRAINTS} assumptions. Empty forecast cells stay "
                     "model-driven; muted placeholders are the current baseline medians.",
                     class_="modal-instructions",
                 ),
                 ui.div(
-                    f"{len(existing_constraints)} constraints",
-                    class_="constraint-count",
-                    aria_live="polite",
+                    ui.div(
+                        f"{len(existing_constraints)} constraints",
+                        class_="constraint-count",
+                        aria_live="polite",
+                    ),
+                    ui.tags.button(
+                        "Show assumptions only",
+                        type="button",
+                        class_="btn-clear scenario-selected-only",
+                        aria_pressed="false",
+                        disabled=not existing_constraints,
+                    ),
+                    ui.tags.button(
+                        "Exit editor",
+                        type="button",
+                        class_="btn-clear scenario-exit",
+                        title="Close the scenario editor (Esc)",
+                    ),
+                    class_="scenario-intro-actions",
                 ),
                 class_="scenario-intro",
             ),
             ui.div(
+                ui.tags.label(
+                    "Scenario name",
+                    ui.tags.input(
+                        id="scenario_name",
+                        type="text",
+                        value=scenario_name,
+                        maxlength="60",
+                        placeholder="Scenario name",
+                        autocomplete="off",
+                        class_="shiny-input-text form-control",
+                        required=True,
+                    ),
+                    class_="scenario-name-field",
+                ),
                 ui.tags.input(
                     id="scenario-variable-search",
                     type="search",
@@ -704,12 +853,80 @@ def scenario_modal(runtime, existing: ForecastResult | None) -> ui.Tag:
                 ),
                 class_="scenario-filters",
             ),
+            ui.div(
+                ui.div(
+                    ui.span("STARTER PATHS", class_="scenario-starter-label"),
+                    ui.tags.button(
+                        "Policy rate +1 pp",
+                        type="button",
+                        class_="scenario-starter",
+                        data_series_id="FEDFUNDS",
+                        data_transformation="level",
+                        data_adjustment="1",
+                        data_scenario_name="Policy rate +1 pp",
+                    ),
+                    ui.tags.button(
+                        "CPI inflation −1 pp",
+                        type="button",
+                        class_="scenario-starter",
+                        data_series_id="CPIAUCSL",
+                        data_transformation="yoy",
+                        data_adjustment="-1",
+                        data_scenario_name="Faster disinflation",
+                    ),
+                    class_="scenario-starters",
+                ),
+                ui.span(
+                    "Starter paths adjust all 12 baseline months and can be edited.",
+                    class_="scenario-starter-help",
+                ),
+                class_="scenario-starter-bar",
+            ),
+            ui.div(
+                ui.div(
+                    "No assumptions entered yet.",
+                    class_="scenario-assumption-empty",
+                ),
+                ui.div(class_="scenario-assumption-list"),
+                class_="scenario-assumption-summary",
+                aria_live="polite",
+                aria_label="Entered scenario assumptions",
+            ),
+            ui.output_ui("scenario_validation", class_="scenario-validation-output"),
             ui.div(ui.div(*grid_cells, class_="scenario-grid"), class_="scenario-grid-scroll"),
+            ui.tags.dialog(
+                ui.h3("Change transformation?"),
+                ui.p(id="scenario-transform-dialog-copy"),
+                ui.div(
+                    ui.tags.button(
+                        "Keep and reinterpret",
+                        type="button",
+                        class_="btn-scenario",
+                        data_transform_action="keep",
+                    ),
+                    ui.tags.button(
+                        "Clear entered values",
+                        type="button",
+                        class_="btn-clear",
+                        data_transform_action="clear",
+                    ),
+                    ui.tags.button(
+                        "Cancel",
+                        type="button",
+                        class_="btn-clear",
+                        data_transform_action="cancel",
+                    ),
+                    class_="scenario-transform-dialog-actions",
+                ),
+                id="scenario-transform-dialog",
+                class_="scenario-transform-dialog",
+            ),
             class_="scenario-modal",
+            data_max_constraints=str(MAX_SCENARIO_CONSTRAINTS),
         ),
-        title="Build a conditional path",
+        title="Edit scenario" if existing or editing else "Create a scenario",
         size="xl",
-        easy_close=True,
+        easy_close=False,
         footer=ui.div(
             ui.div(
                 ui.span("Tip", class_="footer-tip-label"),
@@ -718,11 +935,16 @@ def scenario_modal(runtime, existing: ForecastResult | None) -> ui.Tag:
             ),
             ui.div(
                 ui.input_action_button("reset_modal", "Reset fields", class_="btn-clear"),
+                ui.div(
+                    "Enter at least one valid assumption.",
+                    class_="scenario-action-help",
+                    id="scenario-action-help",
+                    aria_live="polite",
+                ),
                 ui.input_action_button(
                     "run_scenario",
-                    "Run scenario",
+                    "Update scenario" if existing or editing else "Calculate scenario",
                     class_="btn-scenario",
-                    disabled=not existing_constraints,
                 ),
                 class_="modal-actions",
             ),
@@ -735,13 +957,100 @@ def scenario_modal(runtime, existing: ForecastResult | None) -> ui.Tag:
     return modal
 
 
+def scenario_switcher(
+    scenarios: dict[str, NamedScenario],
+    active_scenario_id: str | None,
+    comparison_scenario_id: str | None = None,
+) -> ui.Tag:
+    if not scenarios:
+        return ui.div(ui.span(class_="scenario-dot"), "Baseline", class_="scenario-chip")
+
+    choices = {"": "Baseline"}
+    choices.update({scenario_id: scenario.name for scenario_id, scenario in scenarios.items()})
+    saved_label = (
+        "1 scenario in this session"
+        if len(scenarios) == 1
+        else f"{len(scenarios)} scenarios in this session"
+    )
+    active = scenarios.get(active_scenario_id or "")
+    comparison_choices = {
+        scenario_id: scenario.name
+        for scenario_id, scenario in scenarios.items()
+        if scenario_id != active_scenario_id
+    }
+    export_payload = None
+    if active is not None:
+        export_payload = json.dumps(
+            {
+                "schema_version": 1,
+                "name": active.name,
+                "constraints": [
+                    {
+                        "date": str(active.forecast.dates[step])[:10],
+                        "series_id": series_id,
+                        "value": constraint.value,
+                        "transformation": constraint.transformation,
+                    }
+                    for (step, series_id), constraint in sorted(active.forecast.constraints.items())
+                ],
+            },
+            separators=(",", ":"),
+        )
+    return ui.div(
+        ui.input_select(
+            "active_scenario",
+            None,
+            choices=choices,
+            selected=active_scenario_id or "",
+        ),
+        ui.span(
+            saved_label,
+            class_="scenario-saved-count",
+            title="Scenarios reset when this session ends",
+        ),
+        (
+            ui.input_select(
+                "comparison_scenario",
+                None,
+                choices={"": "Compare with…", **comparison_choices},
+                selected=(
+                    comparison_scenario_id if comparison_scenario_id in comparison_choices else ""
+                ),
+            )
+            if active is not None and comparison_choices
+            else None
+        ),
+        (
+            ui.tags.button(
+                "Export",
+                type="button",
+                class_="scenario-export",
+                data_scenario_export=export_payload,
+                data_scenario_name=active.name,
+                title="Download this scenario's assumptions as JSON",
+            )
+            if active is not None
+            else None
+        ),
+        class_="scenario-switcher",
+    )
+
+
 def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
-    scenario_state: reactive.Value[ForecastResult | None] = reactive.Value(None)
+    scenarios_state: reactive.Value[dict[str, NamedScenario]] = reactive.Value({})
+    active_scenario_id: reactive.Value[str | None] = reactive.Value(None)
+    comparison_scenario_id: reactive.Value[str | None] = reactive.Value(None)
+    scenario_validation_message: reactive.Value[str] = reactive.Value("")
     session_id = token_hex(8)
     session_started_at = perf_counter()
     scenario_requested_at: float | None = None
     scenario_constraint_count = 0
     scenario_variables: list[str] = []
+    editor_scenario_id: str | None = None
+    pending_scenario_id: str | None = None
+    pending_scenario_name: str | None = None
+    pending_creates_scenario = False
+    next_scenario_number = 1
     runtime.telemetry_event("session_started", session_id=session_id)
 
     def _session_ended() -> None:
@@ -755,10 +1064,20 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
 
     @reactive.extended_task
     async def _scenario_task(key: ConstraintKey) -> ForecastResult:
-        async with runtime.scenario_semaphore:
-            return await asyncio.to_thread(_cached_scenario_forecast, runtime.model, key)
+        cached = runtime.scenario_forecasts.get_cached(key)
+        if cached is not None:
+            return cached
+        return await asyncio.to_thread(runtime.scenario_forecasts.forecast, key)
 
     scenario_task = cast(Any, _scenario_task)
+
+    def _active_named_scenario() -> NamedScenario | None:
+        scenario_id = active_scenario_id.get()
+        return scenarios_state.get().get(scenario_id) if scenario_id else None
+
+    def _comparison_named_scenario() -> NamedScenario | None:
+        scenario_id = comparison_scenario_id.get()
+        return scenarios_state.get().get(scenario_id) if scenario_id else None
 
     @reactive.calc
     def _visible_specs() -> tuple[SeriesSpec, ...]:
@@ -820,19 +1139,89 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     @output
     @render.ui
     def scenario_summary() -> ui.Tag:
-        scenario = scenario_state.get()
-        if scenario is None:
-            return ui.div(ui.span(class_="scenario-dot"), "Baseline", class_="scenario-chip")
+        return scenario_switcher(
+            scenarios_state.get(),
+            active_scenario_id.get(),
+            comparison_scenario_id.get(),
+        )
+
+    @output
+    @render.ui
+    def scenario_validation() -> ui.Tag:
+        message = scenario_validation_message.get()
         return ui.div(
-            ui.span(class_="scenario-dot scenario-dot-active"),
-            f"Scenario · {len(scenario.constraints)}",
-            class_="scenario-chip scenario-chip-active",
+            message,
+            class_="scenario-validation-message",
+            role="alert",
+            aria_live="assertive",
+            hidden=not message,
+        )
+
+    @reactive.effect
+    @reactive.event(input.active_scenario)
+    def _select_scenario() -> None:
+        selected = str(input.active_scenario() or "")
+        active_scenario_id.set(selected if selected in scenarios_state.get() else None)
+        if selected == comparison_scenario_id.get() or not selected:
+            comparison_scenario_id.set(None)
+
+    @reactive.effect
+    @reactive.event(input.comparison_scenario)
+    def _select_comparison_scenario() -> None:
+        selected = str(input.comparison_scenario() or "")
+        valid = selected in scenarios_state.get() and selected != active_scenario_id.get()
+        comparison_scenario_id.set(selected if valid else None)
+
+    @reactive.effect
+    def _sync_scenario_actions() -> None:
+        has_active_scenario = _active_named_scenario() is not None
+        ui.update_action_button("edit_scenario", disabled=not has_active_scenario)
+        ui.update_action_button("duplicate_scenario", disabled=not has_active_scenario)
+        ui.update_action_button("delete_scenario", disabled=not has_active_scenario)
+
+    @output
+    @render.ui
+    def workspace_legend() -> ui.Tag:
+        items = [
+            ("history", "History / estimate"),
+            ("baseline", "Baseline median"),
+            ("baseline-band", "Baseline interval"),
+        ]
+        active = _active_named_scenario()
+        comparison = _comparison_named_scenario()
+        if active is not None:
+            items.extend(
+                [
+                    ("scenario", f"{active.name} median"),
+                    ("scenario-band", f"{active.name} interval"),
+                ]
+            )
+        if comparison is not None:
+            items.extend(
+                [
+                    ("comparison", f"{comparison.name} median"),
+                    ("comparison-band", f"{comparison.name} interval"),
+                ]
+            )
+        return ui.div(
+            *[
+                ui.span(
+                    ui.span(class_=f"workspace-legend-mark legend-{kind}"),
+                    label,
+                    class_="workspace-legend-item",
+                )
+                for kind, label in items
+            ],
+            class_="workspace-legend",
+            aria_label="Chart legend",
         )
 
     def _register_chart(chart_spec: SeriesSpec) -> None:
         @output(id=f"chart_{chart_spec.series_id}", suspend_when_hidden=True)
         @render.ui
         def _chart():
+            active = _active_named_scenario()
+            comparison = _comparison_named_scenario()
             raw_transformation = input[f"plot_transform_{chart_spec.series_id}"]()
             transformation: PlotTransformation = (
                 raw_transformation if raw_transformation in PLOT_TRANSFORMATIONS else "level"
@@ -842,8 +1231,11 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                     runtime.history,
                     runtime.baseline,
                     chart_spec,
-                    scenario_state.get(),
+                    active.forecast if active else None,
                     transformation,
+                    scenario_name=active.name if active else None,
+                    comparison=comparison.forecast if comparison else None,
+                    comparison_name=comparison.name if comparison else None,
                 ),
                 separators=(",", ":"),
             ).replace("</", "<\\/")
@@ -860,23 +1252,78 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     @output
     @render.ui
     def forecast_table():
+        active = _active_named_scenario()
+        comparison = _comparison_named_scenario()
         table = forecast_gt(
-            runtime.history, runtime.baseline, _visible_specs(), scenario_state.get()
+            runtime.history,
+            runtime.baseline,
+            _visible_specs(),
+            active.forecast if active else None,
+            scenario_name=active.name if active else None,
+            comparison=comparison.forecast if comparison else None,
+            comparison_name=comparison.name if comparison else None,
         )
         return ui.HTML(table.as_raw_html())
 
     @reactive.effect
     @reactive.event(input.open_scenario)
     def _open_scenario() -> None:
-        ui.modal_show(scenario_modal(runtime, scenario_state.get()))
+        nonlocal editor_scenario_id, next_scenario_number
+        editor_scenario_id = None
+        scenario_validation_message.set("")
+        scenario_name, next_scenario_number = default_scenario_name(
+            scenarios_state.get(), next_scenario_number
+        )
+        ui.modal_show(scenario_modal(runtime, None, scenario_name=scenario_name))
 
     @reactive.effect
-    @reactive.event(input.run_scenario)
+    @reactive.event(input.edit_scenario)
+    def _edit_scenario() -> None:
+        nonlocal editor_scenario_id
+        active = _active_named_scenario()
+        if active is None:
+            return
+        editor_scenario_id = active.scenario_id
+        scenario_validation_message.set("")
+        ui.modal_show(scenario_modal(runtime, active.forecast, scenario_name=active.name))
+
+    @reactive.effect
+    @reactive.event(input.duplicate_scenario)
+    def _duplicate_scenario() -> None:
+        nonlocal editor_scenario_id
+        active = _active_named_scenario()
+        if active is None:
+            return
+        editor_scenario_id = None
+        scenario_validation_message.set("")
+        candidate = duplicate_scenario_name(scenarios_state.get(), active.name)
+        ui.modal_show(scenario_modal(runtime, active.forecast, scenario_name=candidate))
+
+    @reactive.effect
+    @reactive.event(input.run_scenario_request)
     def _run_scenario() -> None:
+        nonlocal pending_creates_scenario, pending_scenario_id, pending_scenario_name
         nonlocal scenario_constraint_count, scenario_requested_at, scenario_variables
         runtime.telemetry_event("scenario_run_clicked", session_id=session_id)
+        scenario_validation_message.set("")
+        if pending_scenario_id is not None:
+            message = "A scenario calculation is already in progress."
+            runtime.telemetry_event(
+                "scenario_rejected",
+                session_id=session_id,
+                reason="scenario_in_progress",
+            )
+            scenario_validation_message.set(message)
+            ui.notification_show(message, type="warning", duration=5)
+            return
+        pending_creates_scenario = False
         constraints: dict[tuple[int, str], ScenarioConstraint] = {}
         try:
+            scenario_name = validate_scenario_name(
+                scenarios_state.get(),
+                input.scenario_name(),
+                scenario_id=editor_scenario_id,
+            )
             for spec in SERIES_SPECS:
                 raw_transformation = input[f"sc_transform_{spec.series_id}"]()
                 transformation: PlotTransformation = (
@@ -885,13 +1332,11 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                 for step in range(FORECAST_HORIZON):
                     raw = input[f"sc_{spec.series_id}_{step}"]()
                     if raw is not None and str(raw).strip():
-                        normalized = str(raw).strip().replace(",", "")
                         try:
-                            value = float(normalized)
+                            value = parse_scenario_value(raw)
                         except ValueError as exc:
                             raise ValueError(
-                                f"{spec.short_label}, {runtime.baseline.dates[step]:%b %Y} "
-                                "must be a valid number."
+                                f"{spec.short_label}, {runtime.baseline.dates[step]:%b %Y}: {exc}"
                             ) from exc
                         constraints[(step, spec.series_id)] = ScenarioConstraint(
                             value=value,
@@ -899,7 +1344,14 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                         )
             if not constraints:
                 raise ValueError("Enter at least one scenario value.")
+            if len(constraints) > MAX_SCENARIO_CONSTRAINTS:
+                raise ValueError(
+                    f"Use at most {MAX_SCENARIO_CONSTRAINTS} scenario assumptions per run."
+                )
             key = _constraint_key(constraints)
+            pending_scenario_id = editor_scenario_id or token_hex(6)
+            pending_scenario_name = scenario_name
+            pending_creates_scenario = editor_scenario_id is None
             scenario_requested_at = perf_counter()
             scenario_constraint_count = len(constraints)
             scenario_variables = sorted({series_id for _step, series_id in constraints})
@@ -909,7 +1361,6 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                 constraint_count=scenario_constraint_count,
                 variables=scenario_variables,
             )
-            ui.modal_remove()
             _ = _scenario_task(key)
         except ValueError as exc:
             runtime.telemetry_event(
@@ -917,11 +1368,13 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                 session_id=session_id,
                 reason="validation_error",
             )
+            scenario_validation_message.set(str(exc))
             ui.notification_show(str(exc), type="error", duration=8)
 
     @reactive.effect
     def _handle_scenario_result() -> None:
-        nonlocal scenario_requested_at
+        nonlocal next_scenario_number, pending_creates_scenario
+        nonlocal pending_scenario_id, pending_scenario_name, scenario_requested_at
         task_status = scenario_task.status()
         if task_status == "success":
             scenario = scenario_task.result()
@@ -934,10 +1387,29 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                     duration_ms=round((perf_counter() - scenario_requested_at) * 1000),
                 )
                 scenario_requested_at = None
-            scenario_state.set(scenario)
-            ui.update_action_button("clear_scenario", disabled=False)
+            if pending_scenario_id is None or pending_scenario_name is None:
+                logger.error("Scenario calculation completed without pending scenario metadata")
+                scenario_validation_message.set("Scenario could not be saved.")
+                ui.notification_show("Scenario could not be saved.", type="error", duration=8)
+                return
+            named_scenario = NamedScenario(
+                scenario_id=pending_scenario_id,
+                name=pending_scenario_name,
+                forecast=scenario,
+            )
+            with reactive.isolate():
+                saved_scenarios = save_named_scenario(scenarios_state.get(), named_scenario)
+            scenarios_state.set(saved_scenarios)
+            active_scenario_id.set(named_scenario.scenario_id)
+            if pending_creates_scenario:
+                next_scenario_number += 1
+            pending_creates_scenario = False
+            pending_scenario_id = None
+            pending_scenario_name = None
+            ui.modal_remove()
             ui.notification_show(
-                f"Scenario applied with {len(scenario.constraints)} constrained values.",
+                f'"{named_scenario.name}" saved with '
+                f"{len(scenario.constraints)} constrained values.",
                 type="message",
                 duration=4,
             )
@@ -953,6 +1425,9 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                     error_type=type(error).__name__,
                 )
                 scenario_requested_at = None
+            pending_creates_scenario = False
+            pending_scenario_id = None
+            pending_scenario_name = None
             logger.error(
                 "Scenario calculation failed: %s",
                 error,
@@ -961,32 +1436,56 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
             message = (
                 str(error) if isinstance(error, ValueError) else "Scenario calculation failed."
             )
+            scenario_validation_message.set(message)
             ui.notification_show(message, type="error", duration=8)
 
     @reactive.effect
-    @reactive.event(input.clear_scenario)
-    def _clear_scenario() -> None:
-        scenario_state.set(None)
-        ui.update_action_button("clear_scenario", disabled=True)
+    @reactive.event(input.delete_scenario)
+    def _delete_scenario() -> None:
+        scenario_id = active_scenario_id.get()
+        if scenario_id is None:
+            return
+        scenarios = dict(scenarios_state.get())
+        deleted = scenarios.pop(scenario_id, None)
+        scenarios_state.set(scenarios)
+        active_scenario_id.set(None)
+        comparison_scenario_id.set(None)
+        if deleted is not None:
+            ui.notification_show(f'"{deleted.name}" deleted.', type="message", duration=4)
 
     @reactive.effect
-    @reactive.event(input.reset_modal)
+    @reactive.event(input.reset_modal_request)
     def _reset_modal() -> None:
+        scenario_name = str(input.scenario_name() or "")
+        scenario_validation_message.set("")
         ui.modal_remove()
-        ui.modal_show(scenario_modal(runtime, None))
+        ui.modal_show(
+            scenario_modal(
+                runtime,
+                None,
+                scenario_name=scenario_name,
+                editing=editor_scenario_id is not None,
+            )
+        )
 
 
 async def _health(runtime, _request: Request) -> JSONResponse:
-    cache = _cached_scenario_forecast.cache_info()
+    cache = runtime.scenario_forecasts.cache_info()
     return JSONResponse(
         {
             "status": "ok",
             "artifact_schema": runtime.artifact.schema_version,
             "release_id": runtime.release_id,
+            "data_status": "refresh_required" if runtime.release_warning else "current",
+            "release_warning": runtime.release_warning,
             "variable_count": len(runtime.model.variable_ids),
             "panel_end": runtime.artifact.panel_end.date().isoformat(),
             "forecast_end": cast(pd.Timestamp, runtime.baseline.dates[-1]).date().isoformat(),
-            "scenario_cache": {"size": cache.currsize, "max_size": cache.maxsize},
+            "scenario_cache": {
+                "size": cache.size,
+                "max_size": cache.max_size,
+                "in_flight": cache.in_flight,
+            },
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -1029,19 +1528,29 @@ class DashboardRuntime:
         artifact: ForecastArtifact,
         *,
         release_id: str = "injected",
+        release_warning: str | None = None,
         static_root: Path = ROOT / "www",
         max_scenario_concurrency: int = MAX_SCENARIO_CONCURRENCY,
         telemetry=telemetry_event,
     ) -> None:
         self.artifact = artifact
         self.release_id = release_id
+        self.release_warning = release_warning
         self.model = artifact.model
         self.baseline = artifact.baseline
         if self.model.history_levels is None:
             raise RuntimeError("The production artifact does not contain model history.")
         self.history = self.model.history_levels
         self.forecast_interval_label = interval_label(self.baseline)
-        self.scenario_semaphore = asyncio.Semaphore(max(1, max_scenario_concurrency))
+        self.model.prepare_forecast_cache(FORECAST_HORIZON)
+        self.scenario_forecasts = ScenarioForecastService(
+            self.model,
+            horizon=FORECAST_HORIZON,
+            draws=POSTERIOR_DRAWS,
+            seed=202507,
+            max_size=SCENARIO_CACHE_SIZE,
+            max_concurrency=max(1, max_scenario_concurrency),
+        )
         self.telemetry_event = telemetry
         self.static_root = static_root
         self.ui = build_ui(self)
@@ -1061,6 +1570,7 @@ class DashboardRuntime:
             "application_started",
             artifact_schema=artifact.schema_version,
             release_id=release_id,
+            refresh_required=release_warning is not None,
             variable_count=len(self.model.variable_ids),
             panel_end=artifact.panel_end.date().isoformat(),
             posterior_draws=self.baseline.draws,
@@ -1089,15 +1599,22 @@ def create_runtime(
         raise ValueError("Pass either artifact or release, not both.")
     if release is None and artifact is None:
         release = load_published_release(root)
+    release_warning: str | None = None
     if release is not None:
         artifact = release.artifact
         release_id = release.release_id
+        if release.metadata is not None:
+            raw_warning = release.metadata.get("refresh_required_reason")
+            if isinstance(raw_warning, str) and raw_warning.strip():
+                release_warning = raw_warning.strip()[:500]
     else:
         release_id = "injected"
-    assert artifact is not None
+    if artifact is None:
+        raise RuntimeError("No forecast artifact was loaded.")
     return DashboardRuntime(
         artifact,
         release_id=release_id,
+        release_warning=release_warning,
         static_root=root / "www",
         max_scenario_concurrency=max_scenario_concurrency,
         telemetry=telemetry,

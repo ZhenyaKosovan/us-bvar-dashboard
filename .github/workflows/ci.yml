@@ -22,25 +22,35 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Verify checked-in application fixtures
         run: |
-          test -s artifacts/bvar_forecast.pkl
-          test -s artifacts/bvar_forecast.pkl.sha256
+          test -s artifacts/active.json
           test -s artifacts/metadata.json
           test -s data/fred_panel.csv
           test -s www/vendor/echarts/echarts.min.js
           test -s www/vendor/echarts/LICENSE
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("artifacts/active.json").read_text())
+          for record in manifest["files"].values():
+              path = Path(record["path"])
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"Missing release fixture: {path}")
+          PY
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 

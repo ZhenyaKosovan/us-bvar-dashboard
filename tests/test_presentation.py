@@ -9,7 +9,6 @@ import pytest
 from us_bvar.config import SERIES_SPECS
 from us_bvar.presentation import (
     echarts_options,
-    forecast_display_frame,
     forecast_gt,
     interval_label,
     interval_range_label,
@@ -18,15 +17,12 @@ from us_bvar.presentation import (
 from us_bvar.transforms import PlotTransformation, transform_forecast_samples
 
 
-def test_display_frame_and_chart_use_six_plus_twelve_months(synthetic_levels, fitted_model) -> None:
+def test_chart_uses_six_history_and_twelve_forecast_months(synthetic_levels, fitted_model) -> None:
     model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
     assert model.history_levels is not None
-    frame = forecast_display_frame(model.history_levels, baseline, SERIES_SPECS)
     options = echarts_options(model.history_levels, baseline, SERIES_SPECS[0])
 
-    assert len(frame) == 18
-    assert frame["Observation"].value_counts().to_dict() == {"Forecast": 12, "Historical": 6}
     assert len(options["series"][0]["data"]) == 6
     assert len(options["series"][1]["data"]) == 13
     assert options["bvarBands"][0]["data"][0] == [
@@ -35,6 +31,8 @@ def test_display_frame_and_chart_use_six_plus_twelve_months(synthetic_levels, fi
         options["series"][0]["data"][-1][1],
     ]
     assert options["xAxis"]["type"] == "time"
+    assert options["legend"] == {"show": False}
+    assert options["grid"]["top"] == 20
     if model.config.interval != (0.16, 0.84):
         raise AssertionError(f"Unexpected interval: {model.config.interval}")
 
@@ -53,6 +51,7 @@ def test_forecast_table_centers_and_formats_values_with_intervals(
     assert "16th–84th percentile interval" in table_html
     assert "Billions · chained 2017 $, SAAR" in table_html
     assert 'class="gt_row gt_center"' in table_html
+    assert "154px" in table_html
     assert "$" in table_html
     assert "%</span>" in table_html
 
@@ -155,8 +154,27 @@ def test_scenario_chart_uses_high_contrast_color(synthetic_levels, fitted_model)
         baseline,
         SERIES_SPECS[0],
         scenario=baseline,
+        scenario_name="Soft landing",
+        comparison=baseline,
+        comparison_name="Oil shock",
     )
+    assert model.history_levels is not None
+    table_html = forecast_gt(
+        model.history_levels,
+        baseline,
+        SERIES_SPECS[:1],
+        scenario=baseline,
+        scenario_name="Soft landing",
+        comparison=baseline,
+        comparison_name="Oil shock",
+    ).as_raw_html()
 
-    assert options["series"][-1]["name"] == "Scenario"
-    assert options["series"][-1]["lineStyle"]["color"] == "#ff8f5c"
-    assert len(options["bvarBands"]) == 2
+    assert options["series"][-2]["name"] == "Soft landing"
+    assert options["bvarBands"][-2]["name"].startswith("Soft landing")
+    assert options["bvarBands"][-1]["name"].startswith("Oil shock")
+    assert "Soft landing" in table_html
+    assert "Oil shock" in table_html
+    assert options["series"][-2]["lineStyle"]["color"] == "#ff8f5c"
+    assert options["series"][-1]["name"] == "Oil shock"
+    assert options["series"][-1]["lineStyle"]["color"] == "#a78bfa"
+    assert len(options["bvarBands"]) == 3

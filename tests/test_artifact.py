@@ -128,6 +128,44 @@ def test_artifact_round_trip(tmp_path, synthetic_levels, production_model: BVAR)
     assert path.with_suffix(".pkl.sha256").is_file()
 
 
+def test_artifact_can_require_a_deployment_pinned_digest(tmp_path, production_model: BVAR) -> None:
+    baseline = production_model.forecast(horizon=12, draws=20, seed=23)
+    artifact = ForecastArtifact.create(production_model, baseline)
+    path = tmp_path / "pinned.pkl"
+    save_artifact(artifact, path)
+
+    restored = load_artifact(path, expected_digest=artifact_sha256(path))
+    assert restored.panel_end == artifact.panel_end
+    with pytest.raises(ValueError, match="deployment-pinned"):
+        load_artifact(path, expected_digest="0" * 64)
+
+
+def test_artifact_rejects_stale_forecast_summary_and_constrained_baseline(
+    tmp_path, production_model: BVAR
+) -> None:
+    baseline = production_model.forecast(horizon=12, draws=20, seed=29)
+    artifact = ForecastArtifact.create(production_model, baseline)
+    path = tmp_path / "inconsistent.pkl"
+    original_median = baseline.median.iloc[0, 0]
+    baseline.median.iloc[0, 0] = original_median + 1.0
+    save_artifact(artifact, path)
+
+    with pytest.raises(ValueError, match="median is inconsistent"):
+        load_artifact(path)
+
+    baseline.median.iloc[0, 0] = original_median
+    cast(dict, baseline.constraints)[(0, "FEDFUNDS")] = 3.0
+    save_artifact(artifact, path)
+
+    with pytest.raises(ValueError, match="baseline must not contain scenario constraints"):
+        load_artifact(path)
+
+
+def test_published_release_requires_an_active_pointer(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="No active model release"):
+        load_published_release(tmp_path)
+
+
 def test_active_release_loads_one_validated_file_set(
     tmp_path, synthetic_levels, production_model: BVAR
 ) -> None:
@@ -171,6 +209,49 @@ def test_active_release_loads_one_validated_file_set(
     assert not release.legacy
     assert release.artifact_path == artifact_path.resolve()
     assert release.metadata_path == metadata_path.resolve()
+
+
+def test_active_release_rejects_digest_consistent_panel_from_another_fit(
+    tmp_path, synthetic_levels, production_model: BVAR
+) -> None:
+    release_dir = tmp_path / "artifacts/releases/release-one"
+    release_dir.mkdir(parents=True)
+    artifact_path = release_dir / "bvar_forecast.pkl"
+    panel_path = release_dir / "fred_panel.csv"
+    metadata_path = release_dir / "metadata.json"
+    save_artifact(
+        ForecastArtifact.create(production_model, production_model.forecast(12, 20, seed=31)),
+        artifact_path,
+    )
+    unrelated_panel = synthetic_levels.copy()
+    unrelated_panel.iloc[0, 1] += 1.0
+    panel_path.write_text(unrelated_panel.to_csv(index_label="date"), encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "release_id": "release-one",
+                "schema_version": ARTIFACT_SCHEMA_VERSION,
+                "artifact_sha256": artifact_sha256(artifact_path),
+                "panel_sha256": artifact_sha256(panel_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = create_release_manifest(
+        tmp_path,
+        "release-one",
+        {
+            "panel": panel_path,
+            "artifact": artifact_path,
+            "checksum": artifact_path.with_suffix(".pkl.sha256"),
+            "metadata": metadata_path,
+        },
+        ARTIFACT_SCHEMA_VERSION,
+    )
+    activate_release(tmp_path, manifest)
+
+    with pytest.raises(ValueError, match="panel does not match the fitted artifact"):
+        load_published_release(tmp_path)
 
 
 def test_active_release_rejects_file_changed_after_activation(

@@ -57,18 +57,34 @@ def split_r_hat(matrix: np.ndarray) -> float:
 
 
 def effective_sample_size(matrix: np.ndarray) -> float:
+    """Estimate split-chain ESS with Geyer's initial positive monotone sequence."""
+
+    chains, draws = matrix.shape
+    total_draws = matrix.size
     centered = matrix - matrix.mean(axis=1, keepdims=True)
-    denominator = np.sum(centered**2, axis=1)
-    autocorrelations: list[float] = []
-    for lag in range(1, matrix.shape[1]):
-        numerator = np.sum(centered[:, :-lag] * centered[:, lag:], axis=1)
-        ratios = np.zeros_like(numerator)
-        np.divide(numerator, denominator, out=ratios, where=denominator > 0)
-        correlation = np.mean(ratios).item()
-        if not np.isfinite(correlation) or correlation <= 0:
+    within_variance = np.sum(centered**2, axis=1).mean() / (draws - 1)
+    between_variance = draws * np.var(matrix.mean(axis=1), ddof=1)
+    marginal_variance = ((draws - 1) * within_variance + between_variance) / draws
+    if not np.isfinite(marginal_variance) or marginal_variance <= 0:
+        return total_draws * 1.0
+
+    autocorrelations = np.empty(draws, dtype=float)
+    autocorrelations[0] = 1.0
+    for lag in range(1, draws):
+        autocovariance = np.sum(centered[:, :-lag] * centered[:, lag:], axis=1).mean() / draws
+        autocorrelations[lag] = 1.0 - (within_variance - autocovariance) / marginal_variance
+
+    paired_sums: list[float] = []
+    for lag in range(0, draws - 1, 2):
+        paired_sum = (autocorrelations[lag] + autocorrelations[lag + 1]).item()
+        if not np.isfinite(paired_sum) or paired_sum <= 0:
             break
-        autocorrelations.append(correlation)
-    return matrix.size / (1.0 + 2.0 * sum(autocorrelations))
+        if paired_sums:
+            paired_sum = min(paired_sum, paired_sums[-1])
+        paired_sums.append(paired_sum)
+
+    integrated_autocorrelation = max(-1.0 + 2.0 * sum(paired_sums), 1.0)
+    return min(total_draws, total_draws / integrated_autocorrelation)
 
 
 def chain_diagnostic(values: np.ndarray, chain_ids: np.ndarray) -> dict[str, float]:
@@ -87,6 +103,80 @@ def chain_diagnostic(values: np.ndarray, chain_ids: np.ndarray) -> dict[str, flo
     }
 
 
+def _split_chain_array(values: np.ndarray, chain_ids: np.ndarray) -> np.ndarray:
+    chains = [values[chain_ids == chain] for chain in np.unique(chain_ids)]
+    if len(chains) < 2 or min(map(len, chains)) < 8:
+        raise RuntimeError(
+            "Diagnostics require two chains with at least eight retained draws each."
+        )
+    retained = min(map(len, chains))
+    retained -= retained % 2
+    matrix = np.stack([chain[:retained] for chain in chains])
+    half = retained // 2
+    return np.concatenate((matrix[:, :half], matrix[:, -half:]), axis=0)
+
+
+def _rank_normalize_columns(values: np.ndarray) -> np.ndarray:
+    flattened = values.reshape(-1, values.shape[-1])
+    ranks = rankdata(flattened, method="average", axis=0)
+    probabilities = (ranks - 0.375) / (len(flattened) + 0.25)
+    return norm.ppf(probabilities).reshape(values.shape)
+
+
+def _split_r_hats(values: np.ndarray) -> np.ndarray:
+    draws = values.shape[1]
+    chain_means = values.mean(axis=1)
+    within = np.mean(np.var(values, axis=1, ddof=1), axis=0)
+    between = draws * np.var(chain_means, axis=0, ddof=1)
+    variance = ((draws - 1) * within + between) / draws
+    regular = np.maximum(1.0, np.sqrt(variance / np.maximum(within, np.finfo(float).eps)))
+    degenerate = within <= np.finfo(float).eps
+    equal_means = np.all(np.isclose(chain_means, chain_means[0]), axis=0)
+    return np.where(degenerate, np.where(equal_means, 1.0, np.inf), regular)
+
+
+def _effective_sample_sizes(values: np.ndarray) -> np.ndarray:
+    chains, draws, _dimensions = values.shape
+    total_draws = chains * draws
+    centered = values - values.mean(axis=1, keepdims=True)
+    within = np.sum(centered**2, axis=1).mean(axis=0) / (draws - 1)
+    between = draws * np.var(values.mean(axis=1), axis=0, ddof=1)
+    marginal = ((draws - 1) * within + between) / draws
+
+    fft_size = 1 << (2 * draws - 1).bit_length()
+    spectrum = np.fft.rfft(centered, n=fft_size, axis=1)
+    autocovariances = (
+        np.fft.irfft(spectrum * np.conjugate(spectrum), n=fft_size, axis=1)[:, :draws, :].real.mean(
+            axis=0
+        )
+        / draws
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        autocorrelations = 1.0 - (within[None, :] - autocovariances) / marginal[None, :]
+    autocorrelations[0] = 1.0
+
+    paired = autocorrelations[0 : draws - 1 : 2] + autocorrelations[1:draws:2]
+    valid = np.isfinite(paired) & (paired > 0)
+    active = np.logical_and.accumulate(valid, axis=0)
+    monotone = np.minimum.accumulate(paired, axis=0)
+    paired_sum = np.sum(np.where(active, monotone, 0.0), axis=0)
+    integrated = np.maximum(-1.0 + 2.0 * paired_sum, 1.0)
+    effective = np.minimum(total_draws, total_draws / integrated)
+    invalid = ~np.isfinite(marginal) | (marginal <= 0)
+    effective[invalid] = total_draws
+    return effective
+
+
+def _array_chain_metrics(
+    values: np.ndarray, chain_ids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    split = _split_chain_array(values, chain_ids)
+    ranked = _rank_normalize_columns(split)
+    median = np.median(split, axis=(0, 1), keepdims=True)
+    folded = _rank_normalize_columns(np.abs(split - median))
+    return np.maximum(_split_r_hats(ranked), _split_r_hats(folded)), _effective_sample_sizes(ranked)
+
+
 def array_diagnostic(
     values: np.ndarray,
     chain_ids: np.ndarray,
@@ -101,13 +191,14 @@ def array_diagnostic(
 
     policy = policy or ConvergencePolicy()
     flattened = values.reshape(len(values), -1)
-    diagnostics = [
-        chain_diagnostic(flattened[:, index], chain_ids) for index in range(flattened.shape[1])
-    ]
-    r_hats = np.asarray([diagnostic["r_hat"] for diagnostic in diagnostics], dtype=float)
-    effective_sizes = np.asarray(
-        [diagnostic["effective_sample_size"] for diagnostic in diagnostics], dtype=float
-    )
+    r_hat_chunks: list[np.ndarray] = []
+    effective_size_chunks: list[np.ndarray] = []
+    for start in range(0, flattened.shape[1], 512):
+        r_hats, effective_sizes = _array_chain_metrics(flattened[:, start : start + 512], chain_ids)
+        r_hat_chunks.append(r_hats)
+        effective_size_chunks.append(effective_sizes)
+    r_hats = np.concatenate(r_hat_chunks)
+    effective_sizes = np.concatenate(effective_size_chunks)
     dimensions = flattened.shape[1]
     r_hat_outside = r_hats > policy.nominal_r_hat
     ess_outside = effective_sizes < policy.nominal_effective_sample_size
@@ -216,4 +307,45 @@ def evaluate_convergence_gate(
             total_ess_outside / total_dimensions if total_dimensions else 0.0
         ),
         "failures": failures,
+    }
+
+
+def compute_posterior_diagnostics(
+    *,
+    coefficients: np.ndarray,
+    innovation_covariances: np.ndarray,
+    terminal_states: np.ndarray,
+    latent_state_paths: np.ndarray,
+    log_likelihood: np.ndarray,
+    companion_radius: np.ndarray,
+    chain_ids: np.ndarray,
+    transition_rows: int,
+    chains: int,
+    policy: ConvergencePolicy,
+) -> dict[str, object]:
+    """Compute the complete convergence record used by publishing and validation."""
+
+    scalar_diagnostics = {
+        "log_likelihood": chain_diagnostic(log_likelihood, chain_ids),
+        "companion_radius": chain_diagnostic(companion_radius, chain_ids),
+    }
+    array_diagnostics = {
+        "transition_coefficients": array_diagnostic(
+            coefficients[:, :transition_rows, :], chain_ids, policy
+        ),
+        "fixed_pandemic_control_coefficients": array_diagnostic(
+            coefficients[:, transition_rows:, :], chain_ids, policy
+        ),
+        "innovation_covariances": array_diagnostic(innovation_covariances, chain_ids, policy),
+        "terminal_states": array_diagnostic(terminal_states, chain_ids, policy),
+        "latent_state_paths": array_diagnostic(latent_state_paths, chain_ids, policy),
+    }
+    gate = evaluate_convergence_gate(scalar_diagnostics, array_diagnostics, policy)
+    retained_per_chain = np.bincount(chain_ids, minlength=chains)
+    return {
+        **gate,
+        "chains": chains,
+        "retained_draws_per_chain": retained_per_chain.tolist(),
+        **scalar_diagnostics,
+        **array_diagnostics,
     }

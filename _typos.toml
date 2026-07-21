@@ -1,0 +1,4 @@
+[default.extend-words]
+yoy = "yoy"
+nd = "nd"
+writeable = "writeable"

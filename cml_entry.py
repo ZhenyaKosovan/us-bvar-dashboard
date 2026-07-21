@@ -30,18 +30,8 @@ def main() -> None:
         raise SystemExit(
             "CML environment not found. Run `python scripts/setup_cml.py` in this project first."
         )
-    active_pointer = ROOT / "artifacts/active.json"
-    if active_pointer.is_file():
-        model_files = (active_pointer,)
-    else:
-        # Migration fallback: the original checked-in artifact remains deployable
-        # until a release pointer is shipped with its staged release directory.
-        model_files = (
-            ROOT / "artifacts/bvar_forecast.pkl",
-            ROOT / "artifacts/bvar_forecast.pkl.sha256",
-        )
     required_files = (
-        *model_files,
+        ROOT / "artifacts/active.json",
         ROOT / "www/vendor/echarts/echarts.min.js",
         ROOT / "www/app.js",
     )
@@ -52,10 +42,13 @@ def main() -> None:
     environment = os.environ.copy()
     environment.setdefault("PYTHONUNBUFFERED", "1")
     environment.setdefault("PYTHONHASHSEED", "0")
-    environment.setdefault("OMP_NUM_THREADS", "1")
-    environment.setdefault("OPENBLAS_NUM_THREADS", "1")
-    environment.setdefault("MKL_NUM_THREADS", "1")
-    environment.setdefault("NUMEXPR_NUM_THREADS", "1")
+    # Scenario requests are concurrent at the application level. Force one native
+    # numerical thread per worker to prevent inherited BLAS settings from multiplying
+    # CPU and memory pressure inside the CML container.
+    environment["OMP_NUM_THREADS"] = "1"
+    environment["OPENBLAS_NUM_THREADS"] = "1"
+    environment["MKL_NUM_THREADS"] = "1"
+    environment["NUMEXPR_NUM_THREADS"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(ROOT / "src"), environment.get("PYTHONPATH", "")))
     )

@@ -26,11 +26,7 @@ from us_bvar.artifact import (
 )
 from us_bvar.config import SERIES_SPECS
 from us_bvar.data import FREDClient
-from us_bvar.diagnostics import (  # type: ignore[import-not-found]
-    array_diagnostic,
-    chain_diagnostic,
-    evaluate_convergence_gate,
-)
+from us_bvar.diagnostics import compute_posterior_diagnostics
 from us_bvar.model import BVAR, BVARConfig, history_semantics_metadata
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,7 +68,7 @@ def _publish_release(
     final_path = release_root / release_id
     try:
         panel_path = staging_path / "fred_panel.csv"
-        artifact_path = staging_path / "bvar_forecast.pkl"
+        artifact_path = staging_path / "bvar_forecast.npz"
         metadata_path = staging_path / "metadata.json"
         panel.to_csv(panel_path, index_label="date")
         save_artifact(artifact, artifact_path)
@@ -113,17 +109,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mcmc-iterations",
         type=int,
-        default=600,
-        help="Mixed-frequency Gibbs iterations (default: 600).",
+        default=1200,
+        help="Mixed-frequency Gibbs iterations (default: 1200).",
     )
     parser.add_argument(
-        "--burn-in", type=int, default=300, help="Discarded Gibbs iterations (default: 300)."
+        "--burn-in", type=int, default=600, help="Discarded Gibbs iterations (default: 600)."
     )
     parser.add_argument(
         "--thin", type=int, default=3, help="Retain every Nth post-burn-in draw (default: 3)."
     )
     parser.add_argument(
-        "--mcmc-chains", type=int, default=2, help="Independent Gibbs chains (default: 2)."
+        "--mcmc-chains", type=int, default=4, help="Independent Gibbs chains (default: 4)."
     )
     parser.add_argument(
         "--offline",
@@ -177,35 +173,21 @@ def main() -> None:
     ):
         raise RuntimeError("Mixed-frequency estimation did not produce diagnostics.")
     policy = model.config.convergence_policy
-    likelihood_diagnostic = chain_diagnostic(model.mcmc_log_likelihood, model.mcmc_chain_ids)
-    radius_diagnostic = chain_diagnostic(model.companion_radii, model.mcmc_chain_ids)
     transition_rows = 1 + len(model.variable_ids) * model.config.lags
-    transition_coefficient_diagnostic = array_diagnostic(
-        model.posterior_coefficients[:, :transition_rows, :], model.mcmc_chain_ids, policy
+    diagnostics = compute_posterior_diagnostics(
+        coefficients=model.posterior_coefficients,
+        innovation_covariances=model.posterior_sigmas,
+        terminal_states=model.posterior_terminal_states,
+        latent_state_paths=model.posterior_state_paths,
+        log_likelihood=model.mcmc_log_likelihood,
+        companion_radius=model.companion_radii,
+        chain_ids=model.mcmc_chain_ids,
+        transition_rows=transition_rows,
+        chains=model.config.mcmc_chains,
+        policy=policy,
     )
-    pandemic_control_diagnostic = array_diagnostic(
-        model.posterior_coefficients[:, transition_rows:, :], model.mcmc_chain_ids, policy
-    )
-    covariance_diagnostic = array_diagnostic(model.posterior_sigmas, model.mcmc_chain_ids, policy)
-    terminal_state_diagnostic = array_diagnostic(
-        model.posterior_terminal_states, model.mcmc_chain_ids, policy
-    )
-    latent_path_diagnostic = array_diagnostic(
-        model.posterior_state_paths, model.mcmc_chain_ids, policy
-    )
-    retained_per_chain = np.bincount(model.mcmc_chain_ids, minlength=model.config.mcmc_chains)
-    scalar_diagnostics = {
-        "log_likelihood": likelihood_diagnostic,
-        "companion_radius": radius_diagnostic,
-    }
-    array_diagnostics = {
-        "transition_coefficients": transition_coefficient_diagnostic,
-        "fixed_pandemic_control_coefficients": pandemic_control_diagnostic,
-        "innovation_covariances": covariance_diagnostic,
-        "terminal_states": terminal_state_diagnostic,
-        "latent_state_paths": latent_path_diagnostic,
-    }
-    gate = evaluate_convergence_gate(scalar_diagnostics, array_diagnostics, policy)
+    retained_per_chain = np.asarray(diagnostics["retained_draws_per_chain"], dtype=int)
+    gate = diagnostics
     maximum_r_hat = cast(float, gate["maximum_r_hat"])
     minimum_effective_size = cast(float, gate["minimum_effective_sample_size"])
     print(
@@ -225,17 +207,27 @@ def main() -> None:
             f"{model.config.minimum_retained_draws_per_chain} retained draws per chain."
         )
     if not cast(bool, gate["accepted"]):
+        for section_name in (
+            "transition_coefficients",
+            "innovation_covariances",
+            "terminal_states",
+            "latent_state_paths",
+        ):
+            section = cast(dict[str, object], diagnostics[section_name])
+            print(
+                f"  {section_name}: "
+                f"R-hat p99={section['r_hat_99th_percentile']:.3f}, "
+                f"max={section['maximum_r_hat']:.3f} "
+                f"at {section['maximum_r_hat_flat_index']}; "
+                f"ESS p01={section['effective_sample_size_1st_percentile']:.1f}, "
+                f"min={section['minimum_effective_sample_size']:.1f} "
+                f"at {section['minimum_ess_flat_index']}",
+                flush=True,
+            )
         raise RuntimeError(
             "MCMC convergence release gate failed: " + ", ".join(cast(list[str], gate["failures"]))
         )
-    model.convergence_diagnostics = {
-        **gate,
-        "chains": model.config.mcmc_chains,
-        "retained_draws_per_chain": retained_per_chain.tolist(),
-        "log_likelihood": likelihood_diagnostic,
-        "companion_radius": radius_diagnostic,
-        **array_diagnostics,
-    }
+    model.convergence_diagnostics = diagnostics
     baseline = model.forecast(horizon=12, draws=args.draws, seed=args.seed)
     artifact = ForecastArtifact.create(model, baseline, created_at=panel.fetched_at)
     forecast_dates = pd.DatetimeIndex(artifact.baseline.dates)

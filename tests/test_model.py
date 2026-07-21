@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from us_bvar import model as model_module
 from us_bvar.config import SERIES_BY_ID, SERIES_SPECS
 from us_bvar.model import BVAR, BVARConfig
+from us_bvar.state_space import observation_system
 from us_bvar.transforms import PlotTransformation, ScenarioConstraint, transform_path
 
 
@@ -15,9 +17,10 @@ def test_default_and_quick_configs_make_estimation_intent_explicit() -> None:
     default = BVARConfig()
     quick = BVARConfig.quick()
 
-    assert default.mcmc_iterations == 600
-    assert default.burn_in == 300
-    assert default.mcmc_chains == 2
+    assert default.mcmc_iterations == 1200
+    assert default.burn_in == 600
+    assert default.mcmc_chains == 4
+    assert default.innovation_prior_strength == 50.0
     assert not default.quick_mode
     assert quick.mcmc_iterations == 8
     assert quick.burn_in == 4
@@ -92,8 +95,8 @@ def test_scenario_rejects_collapsed_posterior_component_weights(
     collapsed[0] = 1.0
     monkeypatch.setattr(
         model,
-        "_constraint_component_probabilities_from_loadings",
-        lambda component_structures, constraint_matrix, targets: collapsed,
+        "_constraint_component_probabilities",
+        lambda components, constraint_matrix, targets: collapsed,
     )
 
     with pytest.raises(ValueError, match="too few posterior components"):
@@ -190,12 +193,26 @@ def test_joint_forecast_covariance_matches_direct_block_calculation(
     synthetic_levels, fitted_model
 ) -> None:
     model = fitted_model
-    rng = np.random.default_rng(19)
-    coefficients, sigma = model._draw_parameters(rng)
+    assert model.posterior_coefficients is not None
+    assert model.posterior_sigmas is not None
+    assert model.posterior_terminal_states is not None
+    coefficients = model.posterior_coefficients[0]
+    sigma = model.posterior_sigmas[0]
     horizon = 5
-    _, actual = model._joint_forecast_moments(coefficients, sigma, horizon)
-
+    component = model._forecast_component(
+        coefficients, sigma, model.posterior_terminal_states[0], horizon
+    )
+    blocks = [response @ component.innovation_factor for response in component.responses]
     n = len(model.variable_ids)
+    loading = np.zeros((horizon * n, horizon * n))
+    for forecast_step in range(horizon):
+        for shock_time in range(forecast_step + 1):
+            loading[
+                forecast_step * n : (forecast_step + 1) * n,
+                shock_time * n : (shock_time + 1) * n,
+            ] = blocks[forecast_step - shock_time]
+    actual = loading @ loading.T
+
     p = model.config.lags
     autoregressive = [coefficients[1 + lag * n : 1 + (lag + 1) * n, :].T for lag in range(p)]
     responses = [np.eye(n)]
@@ -233,7 +250,7 @@ def test_state_regression_uses_every_transition_in_the_kalman_model() -> None:
 def test_quarterly_measurement_aggregates_three_latent_gdp_months() -> None:
     row = np.full(len(SERIES_SPECS), np.nan)
     row[0] = 1.5
-    observed, measurement, covariance = BVAR._observation_system(
+    observed, measurement, covariance = observation_system(
         row,
         tuple(SERIES_BY_ID.values()),
         lags=4,
@@ -296,28 +313,38 @@ def test_paired_terminal_states_drive_their_parameter_components(
 ) -> None:
     model = fitted_model
     assert model.posterior_state_paths is not None
-    components = model._paired_forecast_components()
-
-    assert len(components) == len(model.posterior_state_paths)
+    assert model.posterior_coefficients is not None
+    assert model.posterior_sigmas is not None
+    assert model.posterior_terminal_states is not None
     variables = len(model.variable_ids)
-    for index, (_coefficients, _sigma, terminal_state) in enumerate(components):
+    assert len(model.posterior_terminal_states) == len(model.posterior_state_paths)
+    for index, terminal_state in enumerate(model.posterior_terminal_states):
         assert np.array_equal(terminal_state[:variables], model.posterior_state_paths[index, -1])
 
-    coefficients, sigma, terminal_state = components[0]
+    terminal_state = model.posterior_terminal_states[0]
     shifted_terminal_state = terminal_state.copy()
     shifted_terminal_state[0] += 1.0
-    original_mean, _ = model._joint_forecast_structure(
-        coefficients, sigma, horizon=2, terminal_state=terminal_state
+    original = model._forecast_component(
+        model.posterior_coefficients[0], model.posterior_sigmas[0], terminal_state, horizon=2
     )
-    shifted_mean, _ = model._joint_forecast_structure(
-        coefficients, sigma, horizon=2, terminal_state=shifted_terminal_state
+    shifted = model._forecast_component(
+        model.posterior_coefficients[0],
+        model.posterior_sigmas[0],
+        shifted_terminal_state,
+        horizon=2,
     )
-    assert not np.allclose(original_mean, shifted_mean)
+    assert not np.allclose(original.mean, shifted.mean)
 
 
 def test_invalid_state_space_configuration_is_rejected(synthetic_levels) -> None:
     model = BVAR(config=BVARConfig(quarterly_measurement_variance=-1.0))
     with pytest.raises(ValueError, match="variances must be positive"):
+        model.fit(synthetic_levels)
+
+
+def test_negative_innovation_prior_strength_is_rejected(synthetic_levels) -> None:
+    model = BVAR(config=BVARConfig(innovation_prior_strength=-1.0))
+    with pytest.raises(ValueError, match="covariance prior strength"):
         model.fit(synthetic_levels)
 
 
@@ -341,67 +368,82 @@ def test_fit_handles_a_monthly_ragged_edge(synthetic_levels) -> None:
     assert np.isfinite(model.history_levels.iloc[-1]).all()
 
 
-def test_gaussian_sampling_repairs_covariance_only_after_cholesky_failure(monkeypatch) -> None:
-    rng = np.random.default_rng(23)
-    mean = np.zeros(2)
+def test_forecast_component_repairs_covariance_only_after_cholesky_failure(
+    fitted_model, monkeypatch
+) -> None:
+    model = fitted_model
+    assert model.posterior_coefficients is not None
+    assert model.posterior_sigmas is not None
+    assert model.posterior_terminal_states is not None
 
     def unexpected_repair(matrix: np.ndarray) -> np.ndarray:
         raise AssertionError("A positive-definite covariance should not be repaired.")
 
-    monkeypatch.setattr(BVAR, "_nearest_positive_definite", unexpected_repair)
-    sample = BVAR._sample_gaussian(rng, mean, np.eye(2))
+    monkeypatch.setattr(model_module, "nearest_positive_definite", unexpected_repair)
+    component = model._forecast_component(
+        model.posterior_coefficients[0],
+        model.posterior_sigmas[0],
+        model.posterior_terminal_states[0],
+        horizon=2,
+    )
 
-    if sample.shape != (2,):
-        raise AssertionError(f"Unexpected Gaussian sample shape: {sample.shape}")
+    assert component.innovation_factor.shape == model.posterior_sigmas[0].shape
 
 
-def test_loading_based_conditioning_matches_full_covariance_conditioning() -> None:
-    rng = np.random.default_rng(31)
-    mean = rng.normal(size=6)
-    loading = np.tril(rng.normal(size=(6, 6)))
-    loading[np.diag_indices_from(loading)] += 2.0
-    constraints = np.zeros((2, 6))
+def test_compact_loading_conditioning_hits_every_target(fitted_model) -> None:
+    model = fitted_model
+    component = model._forecast_components(3)[0]
+    variables = len(model.variable_ids)
+    constraints = np.zeros((2, 3 * variables))
     constraints[0, 1] = 1.0
-    constraints[1, 4] = 1.0
-    targets = np.asarray([0.5, -0.25])
-
-    from_covariance = BVAR._conditional_sample(
-        np.random.default_rng(101),
-        mean,
-        loading @ loading.T,
-        constraints,
-        targets,
-    )
-    from_loading = BVAR._conditional_sample_from_loading(
-        np.random.default_rng(101),
-        mean,
-        loading,
-        constraints,
-        targets,
+    constraints[1, 2 * variables + 4] = 1.0
+    targets = constraints @ component.mean.reshape(-1) + np.asarray([0.5, -0.25])
+    samples = component.mean[None, :, :] + model._apply_component_loading(
+        component, np.random.default_rng(101).standard_normal((5, 3, variables))
     )
 
-    assert np.allclose(from_loading, from_covariance)
-    assert np.allclose(constraints @ from_loading, targets)
+    conditioned = model._condition_component_samples(
+        component,
+        samples,
+        constraints,
+        targets,
+        (np.eye(2), True),
+    )
+
+    assert np.allclose(conditioned.reshape(5, -1) @ constraints.T, targets)
 
 
-def test_loading_based_component_weights_match_full_covariance_weights() -> None:
-    rng = np.random.default_rng(37)
-    structures = []
-    moments = []
-    for _ in range(3):
-        mean = rng.normal(size=6)
-        loading = np.tril(rng.normal(size=(6, 6)))
-        loading[np.diag_indices_from(loading)] += 2.0
-        structures.append((mean, loading))
-        moments.append((mean, loading @ loading.T))
-    constraints = np.zeros((2, 6))
+def test_compact_component_weights_match_full_loading_calculation(fitted_model) -> None:
+    model = fitted_model
+    components = model._forecast_components(2)[:3]
+    variables = len(model.variable_ids)
+    constraints = np.zeros((2, 2 * variables))
     constraints[0, 0] = 1.0
-    constraints[1, 5] = 1.0
+    constraints[1, variables + 5] = 1.0
     targets = np.asarray([0.1, 0.2])
 
-    expected = BVAR._constraint_component_probabilities(moments, constraints, targets)
-    actual = BVAR._constraint_component_probabilities_from_loadings(
-        structures, constraints, targets
-    )
+    actual = model._constraint_component_probabilities(components, constraints, targets)
+    log_weights = []
+    for component in components:
+        loading = np.zeros((2 * variables, 2 * variables))
+        blocks = [response @ component.innovation_factor for response in component.responses]
+        loading[:variables, :variables] = blocks[0]
+        loading[variables:, :variables] = blocks[1]
+        loading[variables:, variables:] = blocks[0]
+        projected = constraints @ loading
+        covariance = projected @ projected.T
+        difference = targets - constraints @ component.mean.reshape(-1)
+        sign, log_determinant = np.linalg.slogdet(covariance)
+        assert sign > 0
+        log_weights.append(
+            -0.5
+            * (
+                len(targets) * np.log(2.0 * np.pi)
+                + log_determinant
+                + difference @ np.linalg.solve(covariance, difference)
+            )
+        )
+    expected = np.exp(np.asarray(log_weights) - np.max(log_weights))
+    expected /= expected.sum()
 
     assert np.allclose(actual, expected)

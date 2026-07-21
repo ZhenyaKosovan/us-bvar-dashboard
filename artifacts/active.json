@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "release_id": "20260721T000027Z-dfa1c3b864e0",
+  "schema_version": 6,
+  "files": {
+    "artifact": {
+      "path": "artifacts/releases/20260721T000027Z-dfa1c3b864e0/bvar_forecast.npz",
+      "sha256": "1e7f5e912b2fe929b5b4e01570e87857de003cf2e06429e4f0b33fa1f1c6f729"
+    },
+    "checksum": {
+      "path": "artifacts/releases/20260721T000027Z-dfa1c3b864e0/bvar_forecast.npz.sha256",
+      "sha256": "d81c7754fa81ff75c59b8a6b21f953742d0589990ba1361bbf60943fcc17cb6e"
+    },
+    "metadata": {
+      "path": "artifacts/releases/20260721T000027Z-dfa1c3b864e0/metadata.json",
+      "sha256": "f0f82b36bb4f26a78b25b8bbd4e2c2eea6e2b4bbe5b2ae11985d7d6e145c6764"
+    },
+    "panel": {
+      "path": "artifacts/releases/20260721T000027Z-dfa1c3b864e0/fred_panel.csv",
+      "sha256": "75b655c34c4c054360076c620b51de21bdc4c100e9d50540e07fa7f803e06676"
+    }
+  }
+}

@@ -42,6 +42,9 @@ class SeriesSpec:
     frequency: Literal["monthly", "quarterly"] = "monthly"
     group: SeriesGroup = "Activity"
     default_plot_transform: Literal["level", "mom", "qoq", "yoy"] = "level"
+    fred_frequency: Literal["m", "q"] | None = None
+    fred_aggregation_method: Literal["avg", "sum", "eop"] | None = None
+    exclude_incomplete_period: bool = False
 
 
 SERIES_SPECS: tuple[SeriesSpec, ...] = (
@@ -289,6 +292,9 @@ SERIES_SPECS: tuple[SeriesSpec, ...] = (
         "Percentage points",
         value_suffix=" pp",
         group="Financial",
+        fred_frequency="m",
+        fred_aggregation_method="avg",
+        exclude_incomplete_period=True,
     ),
     SeriesSpec(
         "M2SL",

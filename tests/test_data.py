@@ -60,9 +60,14 @@ def test_panel_preserves_quarterly_gdp_and_monthly_ragged_edge(tmp_path) -> None
             length = 24 if spec.series_id == "PCEC96" else 24 - index
             source_dates = dates[:length]
             values = [100.0 + step for step in range(len(source_dates))]
-        pd.DataFrame({"date": source_dates, "value": values}).to_csv(
-            tmp_path / f"{spec.series_id}.csv", index=False
-        )
+        frame = pd.DataFrame({"date": source_dates, "value": values})
+        if spec.fred_frequency is not None:
+            frame["fred_frequency"] = spec.fred_frequency
+        if spec.fred_aggregation_method is not None:
+            frame["fred_aggregation_method"] = spec.fred_aggregation_method
+        if spec.exclude_incomplete_period:
+            frame["complete_periods_only"] = True
+        frame.to_csv(tmp_path / f"{spec.series_id}.csv", index=False)
 
     panel = FREDClient(api_key="", cache_dir=tmp_path).fetch_panel(
         observation_start="2010-01-01", minimum_observations=12
@@ -100,6 +105,113 @@ def _mock_fred_observations(monkeypatch, observations: list[dict[str, str]]) -> 
             return {"observations": observations}
 
     monkeypatch.setattr(data_module.httpx, "get", lambda *args, **kwargs: Response())
+
+
+def test_daily_credit_spread_requests_monthly_averages_and_records_cache_contract(
+    tmp_path, monkeypatch
+) -> None:
+    spec = next(spec for spec in SERIES_SPECS if spec.series_id == "BAA10Y")
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, list[dict[str, str]]]:
+            return {
+                "observations": [
+                    {"date": "2020-01-01", "value": "2.1"},
+                    {"date": "2020-02-01", "value": "2.0"},
+                    {"date": "2020-03-01", "value": "1.9"},
+                ]
+            }
+
+    def get(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(data_module.httpx, "get", get)
+    values, used_cache = FREDClient(api_key="test", cache_dir=tmp_path).fetch_series(spec)
+
+    assert not used_cache
+    assert values.tolist() == [2.1, 2.0, 1.9]
+    params = captured["params"]
+    assert isinstance(params, dict)
+    assert params["frequency"] == "m"
+    assert params["aggregation_method"] == "avg"
+    cached = pd.read_csv(tmp_path / "BAA10Y.csv")
+    assert (cached["fred_frequency"] == "m").all()
+    assert (cached["fred_aggregation_method"] == "avg").all()
+    assert cached["complete_periods_only"].eq(True).to_numpy(dtype=bool).all().item()
+
+
+def test_incomplete_aggregated_month_is_excluded() -> None:
+    spec = next(spec for spec in SERIES_SPECS if spec.series_id == "BAA10Y")
+    series = pd.Series(
+        [1.8, 1.7],
+        index=pd.DatetimeIndex(["2026-06-01", "2026-07-01"]),
+        name=spec.series_id,
+    )
+
+    result = FREDClient._drop_incomplete_period(
+        series, spec, now=pd.Timestamp("2026-07-19", tz="UTC")
+    )
+
+    assert result.index.equals(pd.DatetimeIndex(["2026-06-01"]))
+
+
+def test_aggregated_series_rejects_legacy_cache_without_contract(tmp_path) -> None:
+    spec = next(spec for spec in SERIES_SPECS if spec.series_id == "BAA10Y")
+    pd.DataFrame({"date": ["2020-01-01"], "value": [2.0]}).to_csv(
+        tmp_path / "BAA10Y.csv", index=False
+    )
+
+    with pytest.raises(data_module.FREDDataError, match="valid local cache"):
+        FREDClient(api_key="", cache_dir=tmp_path).fetch_series(spec)
+
+
+def test_remote_fred_error_message_is_not_exposed(tmp_path, monkeypatch) -> None:
+    spec = SERIES_SPECS[1]
+    sentinel = "remote-secret-and-url-sentinel"
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"error_message": f"rejected https://example.test/?api_key={sentinel}"}
+
+    monkeypatch.setattr(data_module.httpx, "get", lambda *args, **kwargs: Response())
+
+    with pytest.raises(data_module.FREDDataError) as raised:
+        FREDClient(api_key="test", cache_dir=tmp_path).fetch_series(spec)
+
+    assert sentinel not in str(raised.value)
+    assert "example.test" not in str(raised.value)
+    assert spec.series_id in str(raised.value)
+
+
+def test_cache_contract_also_removes_a_mislabeled_incomplete_month(tmp_path) -> None:
+    spec = next(spec for spec in SERIES_SPECS if spec.series_id == "BAA10Y")
+    current_month = pd.Timestamp.now(tz="UTC").tz_localize(None).to_period("M").to_timestamp()
+    previous_month = current_month - pd.offsets.MonthBegin(1)
+    pd.DataFrame(
+        {
+            "date": [previous_month, current_month],
+            "value": [1.5, 1.6],
+            "fred_frequency": ["m", "m"],
+            "fred_aggregation_method": ["avg", "avg"],
+            "complete_periods_only": [True, True],
+        }
+    ).to_csv(tmp_path / "BAA10Y.csv", index=False)
+
+    values, used_cache = FREDClient(api_key="", cache_dir=tmp_path).fetch_series(
+        spec, observation_start=str(previous_month.date())
+    )
+
+    assert used_cache
+    assert values.index.equals(pd.DatetimeIndex([previous_month]))
 
 
 def test_nonempty_partial_api_response_does_not_replace_complete_cache(
@@ -151,6 +263,35 @@ def test_endpoint_regression_does_not_replace_complete_cache(tmp_path, monkeypat
     assert values.iloc[-1] == 103.0
 
 
+def test_later_api_window_preserves_earlier_cached_history(tmp_path, monkeypatch) -> None:
+    spec = SERIES_SPECS[1]
+    cache_path = tmp_path / f"{spec.series_id}.csv"
+    dates = pd.date_range("2019-11-01", periods=4, freq="MS")
+    pd.DataFrame({"date": dates, "value": [98.0, 99.0, 100.0, 101.0]}).to_csv(
+        cache_path, index=False
+    )
+    _mock_fred_observations(
+        monkeypatch,
+        [
+            {"date": "2020-01-01", "value": "110"},
+            {"date": "2020-02-01", "value": "111"},
+        ],
+    )
+
+    values, used_cache = FREDClient(api_key="test", cache_dir=tmp_path).fetch_series(
+        spec, observation_start="2020-01-01"
+    )
+
+    assert not used_cache
+    assert values.tolist() == [110.0, 111.0]
+    cached = pd.read_csv(cache_path)
+    assert cached["date"].tolist() == [date.strftime("%Y-%m-%d") for date in dates[:2]] + [
+        "2020-01-01",
+        "2020-02-01",
+    ]
+    assert cached["value"].tolist() == [98.0, 99.0, 110.0, 111.0]
+
+
 def test_legitimate_revision_and_extension_replace_cache(tmp_path, monkeypatch) -> None:
     spec = SERIES_SPECS[1]
     cache_path = tmp_path / f"{spec.series_id}.csv"
@@ -176,6 +317,27 @@ def test_legitimate_revision_and_extension_replace_cache(tmp_path, monkeypatch) 
     assert values.iloc[1] == 111.0
     cached = pd.read_csv(cache_path)
     assert cached["value"].tolist() == [100.0, 111.0, 102.0, 103.0, 104.0]
+
+
+@pytest.mark.parametrize("payload", [[], "invalid", 42, {"observations": "invalid"}])
+def test_malformed_api_payload_uses_valid_cache(tmp_path, monkeypatch, payload) -> None:
+    spec = SERIES_SPECS[1]
+    cache_path = tmp_path / f"{spec.series_id}.csv"
+    pd.DataFrame({"date": ["2020-01-01"], "value": [100.0]}).to_csv(cache_path, index=False)
+
+    class MalformedResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return payload
+
+    monkeypatch.setattr(data_module.httpx, "get", lambda *args, **kwargs: MalformedResponse())
+
+    values, used_cache = FREDClient(api_key="test", cache_dir=tmp_path).fetch_series(spec)
+
+    assert used_cache
+    assert values.iloc[0] == 100.0
 
 
 def test_invalid_api_payload_does_not_replace_valid_cache(tmp_path, monkeypatch) -> None:

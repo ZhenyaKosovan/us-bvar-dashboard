@@ -6,7 +6,7 @@ from typing import cast
 
 import numpy as np
 import pandas as pd
-from scipy.linalg import cho_factor, cho_solve, solve_triangular
+from scipy.linalg import cho_factor, cho_solve, lstsq, solve_triangular
 from scipy.stats import invwishart
 
 from us_bvar.config import (
@@ -27,9 +27,14 @@ from .state_space import (  # type: ignore[import-not-found]
     companion_transition,
     control_vector,
     kalman_filter,
-    observation_system,
+    nearest_positive_definite,
     simulation_smoother,
 )
+
+
+def _lower_cholesky_factor(matrix: np.ndarray) -> tuple[np.ndarray, bool]:
+    factor, _ = cho_factor(matrix, lower=True, check_finite=False)
+    return np.asarray(factor), True
 
 
 @dataclass(frozen=True)
@@ -38,12 +43,13 @@ class BVARConfig:
     tightness: float = 0.02
     lag_decay: float = 1.0
     own_lag_prior_mean: float = 0.90
+    innovation_prior_strength: float = 50.0
     pandemic_months: tuple[str, ...] = PANDEMIC_CONTROL_MONTHS
     interval: tuple[float, float] = (0.16, 0.84)
-    mcmc_iterations: int = 600
-    burn_in: int = 300
+    mcmc_iterations: int = 1200
+    burn_in: int = 600
     thin: int = 3
-    mcmc_chains: int = 2
+    mcmc_chains: int = 4
     estimation_seed: int = 202504
     monthly_measurement_variance: float = 1e-6
     quarterly_measurement_variance: float = 1e-4
@@ -105,6 +111,13 @@ def history_semantics_metadata() -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _ForecastComponent:
+    mean: np.ndarray
+    responses: np.ndarray
+    innovation_factor: np.ndarray
+
+
 @dataclass(frozen=True)
 class ForecastResult:
     dates: pd.DatetimeIndex
@@ -163,6 +176,7 @@ class BVAR:
         self.unstable_draws_rejected = 0
         self.retention_attempts = 0
         self._n_controls = len(self.config.pandemic_months)
+        self._forecast_component_cache: dict[int, tuple[_ForecastComponent, ...]] = {}
 
     def fit(self, levels: pd.DataFrame) -> BVAR:
         ids = list(self.variable_ids)
@@ -201,19 +215,22 @@ class BVAR:
         x, y = self._design_matrix(initial_path)
         variables = len(ids)
         regressors = x.shape[1]
-        ridge = np.eye(regressors) * 1e-8
-        coefficients = np.linalg.solve(x.T @ x + ridge, x.T @ y)
+        ridge_scale = np.sqrt(1e-8)
+        augmented_x = np.vstack((x, ridge_scale * np.eye(regressors)))
+        augmented_y = np.vstack((y, np.zeros((regressors, variables))))
+        coefficients = lstsq(augmented_x, augmented_y, check_finite=False)[0]
         residuals = y - x @ coefficients
-        sigma = self._nearest_positive_definite(
+        sigma = nearest_positive_definite(
             residuals.T @ residuals / max(len(y) - regressors, variables + 2)
         )
-        prior_mean, _prior_variance = self._minnesota_prior(regressors, variables)
+        prior_mean = self._minnesota_prior_mean(regressors, variables)
         transition_regressors = 1 + variables * self.config.lags
         fixed_controls = coefficients[transition_regressors:].copy()
         self.fixed_control_coefficients = fixed_controls
         transition_prior_variance = self._conjugate_prior_variance(transition_regressors, variables)
-        prior_scale = sigma.copy()
-        prior_df = variables + 2
+        prior_df = variables + 2 + self.config.innovation_prior_strength
+        prior_target = np.diag(np.diag(sigma))
+        prior_scale = (prior_df - variables - 1) * prior_target
 
         first = initial_path.iloc[0].to_numpy(dtype=float)
         initial_mean = np.tile(first, self.config.lags)
@@ -233,6 +250,7 @@ class BVAR:
         for chain in range(self.config.mcmc_chains):
             coefficients = initial_coefficients.copy()
             sigma = initial_sigma.copy()
+            pending_likelihood_index: int | None = None
             rng = np.random.default_rng(self.config.estimation_seed + 104_729 * chain)
             for iteration in range(self.config.mcmc_iterations):
                 filtered = kalman_filter(
@@ -247,10 +265,13 @@ class BVAR:
                     self.config.monthly_measurement_variance,
                     self.config.quarterly_measurement_variance,
                 )
+                if pending_likelihood_index is not None:
+                    retained_likelihoods[pending_likelihood_index] = filtered.log_likelihood
+                    pending_likelihood_index = None
                 transition, _ = companion_transition(
                     coefficients, sigma, variables, self.config.lags
                 )
-                states = simulation_smoother(filtered, transition, rng)
+                states = simulation_smoother(filtered, transition, variables, rng)
                 x, y = self._state_design_matrix(states, pd.DatetimeIndex(model_observations.index))
                 adjusted_y = y - x[:, transition_regressors:] @ fixed_controls
                 transition_coefficients, sigma = self._sample_conjugate_parameters(
@@ -273,25 +294,28 @@ class BVAR:
                     if radius > self.config.max_companion_radius:
                         self.unstable_draws_rejected += 1
                         continue
-                    diagnostic_filter = kalman_filter(
-                        model_observations,
-                        coefficients,
-                        sigma,
-                        self.specs,
-                        self.config.lags,
-                        self.config.pandemic_months,
-                        initial_mean,
-                        initial_covariance,
-                        self.config.monthly_measurement_variance,
-                        self.config.quarterly_measurement_variance,
-                    )
                     retained_coefficients.append(coefficients.copy())
                     retained_sigmas.append(sigma.copy())
                     retained_terminal_states.append(states[-1].copy())
                     retained_paths.append(states[:, :variables].copy())
-                    retained_likelihoods.append(diagnostic_filter.log_likelihood)
+                    retained_likelihoods.append(np.nan)
+                    pending_likelihood_index = len(retained_likelihoods) - 1
                     retained_radii.append(radius)
                     retained_chain_ids.append(chain)
+            if pending_likelihood_index is not None:
+                final_filter = kalman_filter(
+                    model_observations,
+                    coefficients,
+                    sigma,
+                    self.specs,
+                    self.config.lags,
+                    self.config.pandemic_months,
+                    initial_mean,
+                    initial_covariance,
+                    self.config.monthly_measurement_variance,
+                    self.config.quarterly_measurement_variance,
+                )
+                retained_likelihoods[pending_likelihood_index] = final_filter.log_likelihood
 
         if not retained_coefficients:
             raise RuntimeError("The Gibbs sampler retained no posterior draws.")
@@ -367,26 +391,18 @@ class BVAR:
         normalized_constraints = self._normalize_constraints(constraints or {})
         constraint_matrix, targets = self._constraint_system(normalized_constraints, horizon)
         rng = np.random.default_rng(seed)
-        simulations = np.empty((draws, horizon, len(self.variable_ids)))
-        component_structures = [
-            self._joint_forecast_structure(
-                coefficients,
-                sigma,
-                horizon,
-                terminal_state=terminal_state,
-            )
-            for coefficients, sigma, terminal_state in self._paired_forecast_components()
-        ]
+        variables = len(self.variable_ids)
+        components = self._forecast_components(horizon)
         component_ess: float | None = None
         if len(targets):
-            probabilities = self._constraint_component_probabilities_from_loadings(
-                component_structures, constraint_matrix, targets
+            probabilities = self._constraint_component_probabilities(
+                components, constraint_matrix, targets
             )
             effective_ess = cast(float, np.asarray(1.0 / np.sum(probabilities**2)).item())
             component_ess = effective_ess
             minimum_ess = max(
                 self.config.minimum_component_effective_sample_size,
-                self.config.minimum_component_effective_fraction * len(component_structures),
+                self.config.minimum_component_effective_fraction * len(components),
             )
             supported_components = np.count_nonzero(probabilities > 1e-12)
             if effective_ess < minimum_ess or supported_components < 2:
@@ -396,19 +412,34 @@ class BVAR:
                     "Use less extreme assumptions or rebuild with more retained MCMC draws."
                 )
             component_indices = rng.choice(
-                len(component_structures), size=draws, replace=True, p=probabilities
+                len(components), size=draws, replace=True, p=probabilities
             )
         else:
-            component_indices = rng.integers(0, len(component_structures), size=draws)
-        for draw, component in enumerate(component_indices):
-            mean, loading = component_structures[component]
+            component_indices = rng.integers(0, len(components), size=draws)
+
+        standard_normals = rng.standard_normal((draws, horizon, variables))
+        simulations = np.empty((draws, horizon, variables))
+        correction_factor: tuple[np.ndarray, bool] | None = None
+        if len(targets):
+            try:
+                correction_factor = _lower_cholesky_factor(constraint_matrix @ constraint_matrix.T)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
+        for component_index in np.unique(component_indices):
+            positions = np.flatnonzero(component_indices == component_index)
+            component = components[component_index]
+            samples = component.mean[None, :, :] + self._apply_component_loading(
+                component, standard_normals[positions]
+            )
             if len(targets):
-                sample = self._conditional_sample_from_loading(
-                    rng, mean, loading, constraint_matrix, targets
+                samples = self._condition_component_samples(
+                    component,
+                    samples,
+                    constraint_matrix,
+                    targets,
+                    cast(tuple[np.ndarray, bool], correction_factor),
                 )
-            else:
-                sample = mean + loading @ rng.standard_normal(mean.size)
-            simulations[draw] = sample.reshape(horizon, len(self.variable_ids))
+            simulations[positions] = samples
 
         transformer = cast(LevelTransformer, self.transformer)
         history_levels = cast(pd.DataFrame, self.history_levels)
@@ -451,6 +482,7 @@ class BVAR:
                 self.config.tightness,
                 self.config.lag_decay,
                 self.config.own_lag_prior_mean,
+                self.config.innovation_prior_strength,
                 self.config.monthly_measurement_variance,
                 self.config.quarterly_measurement_variance,
                 self.config.diffuse_state_variance,
@@ -495,6 +527,8 @@ class BVAR:
             raise ValueError("Minnesota prior lag decay must be non-negative.")
         if not -1 < self.config.own_lag_prior_mean <= 1:
             raise ValueError("The own-lag prior mean must be in (-1, 1].")
+        if self.config.innovation_prior_strength < 0:
+            raise ValueError("Innovation covariance prior strength must be non-negative.")
         if (
             self.config.monthly_measurement_variance <= 0
             or self.config.quarterly_measurement_variance <= 0
@@ -531,22 +565,6 @@ class BVAR:
         ):
             raise ValueError("MCMC and scenario effective-sample thresholds are invalid.")
 
-    @staticmethod
-    def _observation_system(
-        row: np.ndarray,
-        specs: tuple[SeriesSpec, ...],
-        lags: int,
-        monthly_measurement_variance: float,
-        quarterly_measurement_variance: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return observation_system(
-            row,
-            specs,
-            lags,
-            monthly_measurement_variance,
-            quarterly_measurement_variance,
-        )
-
     def _state_design_matrix(
         self, states: np.ndarray, dates: pd.DatetimeIndex
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -571,20 +589,14 @@ class BVAR:
             rows.append(np.concatenate(([1.0], lagged, controls)))
         return np.vstack(rows), values[p:]
 
-    def _minnesota_prior(self, regressors: int, variables: int) -> tuple[np.ndarray, np.ndarray]:
+    def _minnesota_prior_mean(self, regressors: int, variables: int) -> np.ndarray:
+        """Return the coefficient mean for the conjugate Minnesota-style prior."""
+
         mean = np.zeros((regressors, variables))
-        variance = np.empty((regressors, variables))
-        variance[0, :] = 10.0**2
-        for lag in range(1, self.config.lags + 1):
-            for source in range(variables):
-                row = 1 + (lag - 1) * variables + source
-                for equation in range(variables):
-                    prior_sd = self.config.tightness / (lag**self.config.lag_decay)
-                    variance[row, equation] = prior_sd**2
-                    if lag == 1 and source == equation:
-                        mean[row, equation] = self.config.own_lag_prior_mean
-        variance[1 + self.config.lags * variables :, :] = 10.0**2
-        return mean, variance.reshape(-1, order="F")
+        for source in range(variables):
+            row = 1 + source
+            mean[row, source] = self.config.own_lag_prior_mean
+        return mean
 
     def _conjugate_prior_variance(self, regressors: int, variables: int) -> np.ndarray:
         """Return the row covariance for the conjugate Minnesota-style prior."""
@@ -608,7 +620,7 @@ class BVAR:
         prior_mean: np.ndarray,
         prior_variance: np.ndarray,
         prior_scale: np.ndarray,
-        prior_df: int,
+        prior_df: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Draw a complete VAR transition system from its conjugate posterior."""
 
@@ -625,10 +637,12 @@ class BVAR:
         rhs = x.T @ y + prior_precision[:, None] * prior_mean
         factor = cho_factor(precision, lower=True, check_finite=False)
         posterior_mean = cho_solve(factor, rhs, check_finite=False)
-        prior_quadratic = prior_mean.T @ (prior_precision[:, None] * prior_mean)
-        posterior_quadratic = posterior_mean.T @ precision @ posterior_mean
-        posterior_scale = cls._nearest_positive_definite(
-            prior_scale + y.T @ y + prior_quadratic - posterior_quadratic
+        residuals = y - x @ posterior_mean
+        prior_deviation = posterior_mean - prior_mean
+        posterior_scale = nearest_positive_definite(
+            prior_scale
+            + residuals.T @ residuals
+            + prior_deviation.T @ (prior_precision[:, None] * prior_deviation)
         )
         sigma = np.atleast_2d(
             np.asarray(
@@ -641,147 +655,62 @@ class BVAR:
             )
         )
         sigma = (sigma + sigma.T) / 2.0
-        row_factor = solve_triangular(
+        try:
+            sigma_factor = np.linalg.cholesky(sigma)
+        except np.linalg.LinAlgError as exc:
+            del exc
+            sigma_factor = np.linalg.cholesky(nearest_positive_definite(sigma))
+        scaled_noise = rng.standard_normal((regressors, variables)) @ sigma_factor.T
+        coefficients = posterior_mean + solve_triangular(
             factor[0].T,
-            np.eye(regressors),
+            scaled_noise,
             lower=False,
             check_finite=False,
         )
-        sigma_factor = np.linalg.cholesky(cls._nearest_positive_definite(sigma))
-        coefficients = (
-            posterior_mean
-            + row_factor @ rng.standard_normal((regressors, variables)) @ sigma_factor.T
-        )
         return coefficients, sigma
 
-    @staticmethod
-    def _sample_coefficients(
-        rng: np.random.Generator,
-        x: np.ndarray,
-        y: np.ndarray,
-        sigma: np.ndarray,
-        prior_mean: np.ndarray,
-        prior_variance: np.ndarray,
-        current_coefficients: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Draw one coefficient block with an equation-wise Gibbs sweep.
+    def prepare_forecast_cache(self, horizon: int) -> None:
+        """Build compact immutable forecast structures before serving concurrent requests."""
 
-        A direct draw under an independent Minnesota prior factors a dense matrix
-        with ``(regressors * variables)`` rows. That is harmless for a small
-        teaching VAR but needlessly cubic for a medium-size system. Conditional on
-        the other equations, the multivariate-normal likelihood is an ordinary
-        Gaussian regression with the Schur-complement innovation variance. Sweeping
-        over equations is an exact Gibbs update for the same posterior while only
-        factoring ``regressors``-square systems.
-        """
+        if horizon < 1:
+            raise ValueError("Forecast horizon must be positive.")
+        self._forecast_components(horizon)
 
-        regressors, variables = prior_mean.shape
-        if x.shape[1] != regressors or y.shape[1] != variables:
-            raise ValueError("Coefficient sampler inputs have incompatible dimensions.")
-        variance = prior_variance.reshape((regressors, variables), order="F")
-        coefficients = (
-            np.asarray(current_coefficients, dtype=float).copy()
-            if current_coefficients is not None
-            else np.linalg.lstsq(x, y, rcond=None)[0]
-        )
-        if coefficients.shape != (regressors, variables):
-            raise ValueError("Current coefficients have an incompatible shape.")
+    def clear_derived_cache(self) -> None:
+        """Drop immutable forecast structures that can be rebuilt from posterior draws."""
 
-        x_crossproduct = x.T @ x
-        all_equations = np.arange(variables)
-        for equation in rng.permutation(variables):
-            others = all_equations[all_equations != equation]
-            if len(others):
-                other_covariance = sigma[np.ix_(others, others)]
-                loadings = np.linalg.solve(other_covariance, sigma[others, equation])
-                try:
-                    conditional_variance = float(
-                        sigma[equation, equation] - sigma[equation, others] @ loadings
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("Conditional innovation variance is not numeric.") from exc
-                other_residuals = y[:, others] - x @ coefficients[:, others]
-                adjusted_target = y[:, equation] - other_residuals @ loadings
-            else:
-                try:
-                    conditional_variance = float(sigma[equation, equation])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("Conditional innovation variance is not numeric.") from exc
-                adjusted_target = y[:, equation]
-            conditional_variance = max(conditional_variance, np.finfo(float).eps)
-            prior_precision = 1.0 / variance[:, equation]
-            precision = x_crossproduct / conditional_variance
-            precision.flat[:: regressors + 1] += prior_precision
-            rhs = (
-                x.T @ adjusted_target / conditional_variance
-                + prior_precision * prior_mean[:, equation]
-            )
-            factor = cho_factor(precision, lower=True, check_finite=False)
-            posterior_mean = cho_solve(factor, rhs, check_finite=False)
-            innovation = solve_triangular(
-                factor[0].T,
-                rng.standard_normal(regressors),
-                lower=False,
-                check_finite=False,
-            )
-            coefficients[:, equation] = posterior_mean + innovation
-        return coefficients
+        self._forecast_component_cache = {}
 
-    def _draw_parameters(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    def _forecast_components(self, horizon: int) -> tuple[_ForecastComponent, ...]:
         self._require_fit()
-        coefficients = cast(np.ndarray, self.posterior_coefficients)
-        sigmas = cast(np.ndarray, self.posterior_sigmas)
-        index = rng.integers(len(coefficients)).item()
-        return coefficients[index].copy(), sigmas[index].copy()
-
-    def _paired_forecast_components(
-        self,
-    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Return retained parameters paired with their retained terminal states.
-
-        The index of a terminal state is the same posterior component index as its
-        coefficients and innovation covariance. This pairing is used for forecast
-        dynamics; it does not create paired draws for the fixed published history.
-        """
-
-        self._require_fit()
+        cache = getattr(self, "_forecast_component_cache", None)
+        if cache is None:
+            cache = {}
+            self._forecast_component_cache = cache
+        cached = cache.get(horizon)
+        if cached is not None:
+            return cached
         coefficients = cast(np.ndarray, self.posterior_coefficients)
         sigmas = cast(np.ndarray, self.posterior_sigmas)
         terminal_states = cast(np.ndarray, self.posterior_terminal_states)
-        return list(zip(coefficients, sigmas, terminal_states, strict=True))
-
-    def _joint_forecast_moments(
-        self,
-        coefficients: np.ndarray,
-        sigma: np.ndarray,
-        horizon: int,
-        terminal_state: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        means, loading = self._joint_forecast_structure(
-            coefficients, sigma, horizon, terminal_state
+        components = tuple(
+            self._forecast_component(coefficients_draw, sigma, terminal_state, horizon)
+            for coefficients_draw, sigma, terminal_state in zip(
+                coefficients, sigmas, terminal_states, strict=True
+            )
         )
-        covariance = loading @ loading.T
-        return means, (covariance + covariance.T) / 2.0
+        cache[horizon] = components
+        return components
 
-    def _joint_forecast_structure(
+    def _forecast_component(
         self,
         coefficients: np.ndarray,
         sigma: np.ndarray,
+        terminal_state: np.ndarray,
         horizon: int,
-        terminal_state: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return forecast dynamics conditional on one paired terminal state.
-
-        ``terminal_state`` is a retained component-specific initial condition. If it
-        is omitted, the posterior mean state is used for deterministic moment checks;
-        routine forecast simulation passes the state paired with the parameters.
-        """
-
+    ) -> _ForecastComponent:
         variables = len(self.variable_ids)
         lags = self.config.lags
-        if terminal_state is None:
-            posterior_terminal_states = cast(np.ndarray, self.posterior_terminal_states)
-            terminal_state = posterior_terminal_states.mean(axis=0)
         history = [
             terminal_state[lag * variables : (lag + 1) * variables].copy()
             for lag in range(lags - 1, -1, -1)
@@ -793,26 +722,68 @@ class BVAR:
             means[step] = x @ coefficients
             history.append(means[step])
 
-        autoregressive = [
-            coefficients[1 + lag * variables : 1 + (lag + 1) * variables, :].T
-            for lag in range(lags)
-        ]
-        responses: list[np.ndarray] = [np.eye(variables)]
+        autoregressive = np.stack(
+            [
+                coefficients[1 + lag * variables : 1 + (lag + 1) * variables, :].T
+                for lag in range(lags)
+            ]
+        )
+        responses = np.empty((horizon, variables, variables))
+        responses[0] = np.eye(variables)
         for forecast_step in range(1, horizon):
-            response = np.zeros((variables, variables))
+            responses[forecast_step] = 0.0
             for lag in range(1, min(lags, forecast_step) + 1):
-                response += autoregressive[lag - 1] @ responses[forecast_step - lag]
-            responses.append(response)
+                responses[forecast_step] += autoregressive[lag - 1] @ responses[forecast_step - lag]
+        try:
+            innovation_factor = np.linalg.cholesky(sigma)
+        except np.linalg.LinAlgError as exc:
+            del exc
+            innovation_factor = np.linalg.cholesky(nearest_positive_definite(sigma))
+        for array in (means, responses, innovation_factor):
+            array.setflags(write=False)
+        return _ForecastComponent(means, responses, innovation_factor)
 
-        innovation_cholesky = np.linalg.cholesky(self._nearest_positive_definite(sigma))
-        loading = np.zeros((horizon * variables, horizon * variables))
-        for forecast_step in range(horizon):
-            for shock_time in range(forecast_step + 1):
-                loading[
-                    forecast_step * variables : (forecast_step + 1) * variables,
-                    shock_time * variables : (shock_time + 1) * variables,
-                ] = responses[forecast_step - shock_time] @ innovation_cholesky
-        return means.reshape(-1), loading
+    @staticmethod
+    def _apply_component_loading(
+        component: _ForecastComponent, standard_normals: np.ndarray
+    ) -> np.ndarray:
+        innovations = standard_normals @ component.innovation_factor.T
+        result = np.zeros_like(innovations)
+        horizon = innovations.shape[1]
+        for response_lag, response in enumerate(component.responses):
+            result[:, response_lag:, :] += innovations[:, : horizon - response_lag, :] @ response.T
+        return result
+
+    @staticmethod
+    def _project_component_loading(
+        component: _ForecastComponent, constraint_matrix: np.ndarray
+    ) -> np.ndarray:
+        horizon, variables = component.mean.shape
+        constraint_blocks = constraint_matrix.reshape(len(constraint_matrix), horizon, variables)
+        projected = np.zeros((len(constraint_matrix), horizon, variables))
+        loading_blocks = component.responses @ component.innovation_factor
+        for response_lag, loading_block in enumerate(loading_blocks):
+            projected[:, : horizon - response_lag, :] += (
+                constraint_blocks[:, response_lag:, :] @ loading_block
+            )
+        return projected.reshape(len(constraint_matrix), horizon * variables)
+
+    @staticmethod
+    def _component_cross_covariance(
+        component: _ForecastComponent, projected_loading: np.ndarray
+    ) -> np.ndarray:
+        horizon, variables = component.mean.shape
+        projected_blocks = projected_loading.reshape(-1, horizon, variables).transpose(1, 2, 0)
+        result = np.zeros((horizon, variables, len(projected_loading)))
+        loading_blocks = component.responses @ component.innovation_factor
+        for response_lag, loading_block in enumerate(loading_blocks):
+            result[response_lag:] += np.einsum(
+                "ij,sjm->sim",
+                loading_block,
+                projected_blocks[: horizon - response_lag],
+                optimize=True,
+            )
+        return result.reshape(horizon * variables, len(projected_loading))
 
     @staticmethod
     def _normalize_constraints(
@@ -910,21 +881,20 @@ class BVAR:
             np.asarray(targets, dtype=float),
         )
 
-    @classmethod
     def _constraint_component_probabilities(
-        cls,
-        component_moments: list[tuple[np.ndarray, np.ndarray]],
+        self,
+        components: tuple[_ForecastComponent, ...],
         constraint_matrix: np.ndarray,
         targets: np.ndarray,
     ) -> np.ndarray:
-        log_weights = np.empty(len(component_moments))
+        log_weights = np.empty(len(components))
         constant = len(targets) * np.log(2.0 * np.pi)
-        for index, (mean, covariance) in enumerate(component_moments):
-            projected_mean = constraint_matrix @ mean
-            projected_covariance = constraint_matrix @ covariance @ constraint_matrix.T
+        for index, component in enumerate(components):
+            projected_loading = self._project_component_loading(component, constraint_matrix)
+            projected_covariance = projected_loading @ projected_loading.T
+            difference = targets - constraint_matrix @ component.mean.reshape(-1)
             try:
-                factor = cho_factor(projected_covariance, lower=True, check_finite=False)
-                difference = targets - projected_mean
+                factor = _lower_cholesky_factor(projected_covariance)
                 quadratic = difference @ cho_solve(factor, difference, check_finite=False)
                 log_determinant = 2.0 * np.log(np.diag(factor[0])).sum()
             except np.linalg.LinAlgError as exc:
@@ -937,99 +907,35 @@ class BVAR:
             raise ValueError("The scenario is too improbable for the retained posterior draws.")
         return weights / total
 
-    @classmethod
-    def _constraint_component_probabilities_from_loadings(
-        cls,
-        component_structures: list[tuple[np.ndarray, np.ndarray]],
+    def _condition_component_samples(
+        self,
+        component: _ForecastComponent,
+        samples: np.ndarray,
         constraint_matrix: np.ndarray,
         targets: np.ndarray,
+        correction_factor: tuple[np.ndarray, bool],
     ) -> np.ndarray:
-        """Weight posterior components without materializing full forecast covariances."""
-
-        projected: list[tuple[np.ndarray, np.ndarray]] = []
-        for mean, loading in component_structures:
-            projected_loading = constraint_matrix @ loading
-            covariance = projected_loading @ projected_loading.T
-            projected.append((constraint_matrix @ mean, covariance))
-        identity = np.eye(len(targets))
-        return cls._constraint_component_probabilities(
-            [(mean, covariance) for mean, covariance in projected], identity, targets
-        )
-
-    @classmethod
-    def _conditional_sample(
-        cls,
-        rng: np.random.Generator,
-        mean: np.ndarray,
-        covariance: np.ndarray,
-        constraint_matrix: np.ndarray,
-        targets: np.ndarray,
-    ) -> np.ndarray:
-        sample = cls._sample_gaussian(rng, mean, covariance)
-        cross_covariance = covariance @ constraint_matrix.T
-        conditioned_system = constraint_matrix @ cross_covariance
-        try:
-            adjustment = np.linalg.solve(conditioned_system, targets - constraint_matrix @ sample)
-        except np.linalg.LinAlgError as exc:
-            raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
-        result = sample + cross_covariance @ adjustment
-        residual = targets - constraint_matrix @ result
-        if np.any(np.abs(residual) > 1e-12):
-            correction_system = constraint_matrix @ constraint_matrix.T
-            try:
-                result += constraint_matrix.T @ np.linalg.solve(correction_system, residual)
-            except np.linalg.LinAlgError as exc:
-                raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
-        return result
-
-    @classmethod
-    def _conditional_sample_from_loading(
-        cls,
-        rng: np.random.Generator,
-        mean: np.ndarray,
-        loading: np.ndarray,
-        constraint_matrix: np.ndarray,
-        targets: np.ndarray,
-    ) -> np.ndarray:
-        sample = mean + loading @ rng.standard_normal(mean.size)
-        projected_loading = constraint_matrix @ loading
+        projected_loading = self._project_component_loading(component, constraint_matrix)
         conditioned_system = projected_loading @ projected_loading.T
-        cross_covariance = loading @ projected_loading.T
+        cross_covariance = self._component_cross_covariance(component, projected_loading)
         try:
-            adjustment = np.linalg.solve(conditioned_system, targets - constraint_matrix @ sample)
+            factor = _lower_cholesky_factor(conditioned_system)
+            flat_samples = samples.reshape(len(samples), -1)
+            differences = targets[None, :] - flat_samples @ constraint_matrix.T
+            adjustments = cho_solve(factor, differences.T, check_finite=False).T
         except np.linalg.LinAlgError as exc:
             raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
-        result = sample + cross_covariance @ adjustment
-        residual = targets - constraint_matrix @ result
-        if np.any(np.abs(residual) > 1e-12):
-            correction_system = constraint_matrix @ constraint_matrix.T
-            try:
-                result += constraint_matrix.T @ np.linalg.solve(correction_system, residual)
-            except np.linalg.LinAlgError as exc:
-                raise ValueError("Scenario constraints are redundant or inconsistent.") from exc
-        return result
-
-    @staticmethod
-    def _sample_gaussian(
-        rng: np.random.Generator, mean: np.ndarray, covariance: np.ndarray
-    ) -> np.ndarray:
-        symmetric = (covariance + covariance.T) / 2.0
-        try:
-            cholesky = np.linalg.cholesky(symmetric)
-        except np.linalg.LinAlgError as exc:
-            del exc
-            try:
-                cholesky = np.linalg.cholesky(BVAR._nearest_positive_definite(symmetric))
-            except np.linalg.LinAlgError as repair_exc:
-                raise ValueError("Forecast covariance is not positive definite.") from repair_exc
-        return mean + cholesky @ rng.standard_normal(mean.size)
-
-    @staticmethod
-    def _nearest_positive_definite(matrix: np.ndarray) -> np.ndarray:
-        symmetric = (matrix + matrix.T) / 2.0
-        values, vectors = np.linalg.eigh(symmetric)
-        floor = max(np.max(np.abs(values)).item() * 1e-10, 1e-10)
-        return (vectors * np.maximum(values, floor)) @ vectors.T
+        flat_samples += adjustments @ cross_covariance.T
+        residuals = targets[None, :] - flat_samples @ constraint_matrix.T
+        needs_correction = np.any(np.abs(residuals) > 1e-12, axis=1)
+        if np.any(needs_correction):
+            corrections = cho_solve(
+                correction_factor,
+                residuals[needs_correction].T,
+                check_finite=False,
+            ).T
+            flat_samples[needs_correction] += corrections @ constraint_matrix
+        return flat_samples.reshape(samples.shape)
 
     def _require_fit(self) -> None:
         if (

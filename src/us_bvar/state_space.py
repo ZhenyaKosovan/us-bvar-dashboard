@@ -139,10 +139,21 @@ def kalman_filter(
             controls = control_vector(date, control_months)
             state_intercept = np.zeros(dimension)
             state_intercept[:variables] = intercept + controls @ control_coefficients
-            predicted_mean = state_intercept + transition @ previous_mean
-            predicted_covariance = (
-                transition @ previous_covariance @ transition.T + process_covariance
+            predicted_mean = state_intercept
+            predicted_mean[:variables] += transition[:variables] @ previous_mean
+            predicted_mean[variables:] = previous_mean[:-variables]
+            autoregressive = transition[:variables]
+            shifted_dimension = dimension - variables
+            predicted_covariance = np.empty_like(previous_covariance)
+            predicted_covariance[:variables, :variables] = (
+                autoregressive @ previous_covariance @ autoregressive.T + sigma
             )
+            top_right = autoregressive @ previous_covariance[:, :shifted_dimension]
+            predicted_covariance[:variables, variables:] = top_right
+            predicted_covariance[variables:, :variables] = top_right.T
+            predicted_covariance[variables:, variables:] = previous_covariance[
+                :shifted_dimension, :shifted_dimension
+            ]
             predicted_covariance = _symmetrize(predicted_covariance)
 
         observed, measurement, measurement_covariance = observation_system(
@@ -201,6 +212,7 @@ def kalman_filter(
 def simulation_smoother(
     result: KalmanResult,
     transition: np.ndarray,
+    variables: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
     """Draw one companion-state path using forward filtering/backward sampling."""
@@ -210,7 +222,10 @@ def simulation_smoother(
     states[-1] = _sample_psd(rng, result.filtered_means[-1], result.filtered_covariances[-1])
     for time in range(periods - 2, -1, -1):
         predicted_covariance = result.predicted_covariances[time + 1]
-        filtered_transition = result.filtered_covariances[time] @ transition.T
+        filtered_covariance = result.filtered_covariances[time]
+        filtered_transition = np.empty_like(filtered_covariance)
+        filtered_transition[:, :variables] = filtered_covariance @ transition[:variables].T
+        filtered_transition[:, variables:] = filtered_covariance[:, :-variables]
         smoothing_gain = cho_solve(
             _factor_positive_definite(predicted_covariance),
             filtered_transition.T,
@@ -241,13 +256,14 @@ def _sample_psd(
     covariance: np.ndarray,
 ) -> np.ndarray:
     symmetric = _symmetrize(covariance)
-    scale = max(float(np.max(np.abs(np.diag(symmetric)))), 1.0)
+    scale = max(np.max(np.abs(np.diag(symmetric))).item(), 1.0)
     identity = np.eye(len(mean))
     for relative_jitter in (0.0, 1e-12, 1e-10, 1e-8):
         try:
             cholesky = np.linalg.cholesky(symmetric + relative_jitter * scale * identity)
             return mean + cholesky @ rng.standard_normal(mean.size)
-        except np.linalg.LinAlgError:
+        except np.linalg.LinAlgError as exc:
+            del exc
             continue
     values, vectors = np.linalg.eigh(symmetric)
     return mean + (vectors * np.sqrt(np.maximum(values, 0.0))) @ rng.standard_normal(mean.size)
@@ -257,7 +273,7 @@ def _symmetrize(matrix: np.ndarray) -> np.ndarray:
     return (matrix + matrix.T) / 2.0
 
 
-def _positive_definite(matrix: np.ndarray) -> np.ndarray:
+def nearest_positive_definite(matrix: np.ndarray) -> np.ndarray:
     symmetric = _symmetrize(matrix)
     values, vectors = np.linalg.eigh(symmetric)
     floor = max(np.max(np.abs(values)).item() * 1e-10, 1e-10)
@@ -268,15 +284,18 @@ def _factor_positive_definite(matrix: np.ndarray) -> tuple[np.ndarray, bool]:
     """Factor a covariance with cheap jitter before an eigenvalue repair fallback."""
 
     symmetric = _symmetrize(matrix)
-    scale = max(float(np.max(np.abs(np.diag(symmetric)))), 1.0)
+    scale = max(np.max(np.abs(np.diag(symmetric))).item(), 1.0)
     identity = np.eye(len(symmetric))
     for relative_jitter in (0.0, 1e-12, 1e-10, 1e-8):
         try:
-            return cho_factor(
+            factor, _ = cho_factor(
                 symmetric + relative_jitter * scale * identity,
                 lower=True,
                 check_finite=False,
             )
-        except np.linalg.LinAlgError:
+            return np.asarray(factor), True
+        except np.linalg.LinAlgError as exc:
+            del exc
             continue
-    return cho_factor(_positive_definite(symmetric), lower=True, check_finite=False)
+    factor, _ = cho_factor(nearest_positive_definite(symmetric), lower=True, check_finite=False)
+    return np.asarray(factor), True

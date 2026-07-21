@@ -9,6 +9,7 @@ from us_bvar.config import ConvergencePolicy
 from us_bvar.diagnostics import (
     array_diagnostic,
     chain_diagnostic,
+    effective_sample_size,
     evaluate_convergence_gate,
 )
 from us_bvar.model import history_semantics_metadata
@@ -63,6 +64,24 @@ def test_rank_normalized_rhat_rejects_constant_disagreeing_chains() -> None:
     diagnostic = chain_diagnostic(values, chain_ids)
 
     assert np.isinf(diagnostic["r_hat"])
+
+
+def test_effective_sample_size_keeps_strong_even_lag_dependence() -> None:
+    rng = np.random.default_rng(123)
+    matrix = np.empty((4, 1_000))
+    for chain in range(len(matrix)):
+        values = rng.normal(size=1_002)
+        for index in range(2, len(values)):
+            values[index] = 0.95 * values[index - 2] + rng.normal()
+        matrix[chain] = values[2:]
+
+    centered = matrix - matrix.mean(axis=1, keepdims=True)
+    lag_one = np.mean(
+        np.sum(centered[:, :-1] * centered[:, 1:], axis=1) / np.sum(centered**2, axis=1)
+    )
+
+    assert lag_one < 0
+    assert effective_sample_size(matrix) < 500
 
 
 def test_array_diagnostic_checks_every_parameter_dimension() -> None:

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-import httpx
+import httpx  # type: ignore[import-not-found]
 import pandas as pd
 
 from us_bvar.config import SERIES_SPECS, SeriesSpec
@@ -75,14 +76,28 @@ class FREDClient:
             "observation_start": observation_start,
             "sort_order": "asc",
         }
+        if spec.fred_frequency is not None:
+            params["frequency"] = spec.fred_frequency
+        if spec.fred_aggregation_method is not None:
+            params["aggregation_method"] = spec.fred_aggregation_method
         try:
             response = httpx.get(FRED_OBSERVATIONS_URL, params=params, timeout=self.timeout)
             response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, Mapping):
+                raise FREDDataError(f"FRED returned malformed JSON for {spec.series_id}.")
             if "error_message" in payload:
-                raise FREDDataError(str(payload["error_message"]))
+                raise FREDDataError(f"FRED rejected the request for {spec.series_id}.")
             observations = payload.get("observations", [])
-            frame = pd.DataFrame(observations, columns=["date", "value"])
+            if not isinstance(observations, list) or not all(
+                isinstance(observation, Mapping) for observation in observations
+            ):
+                raise FREDDataError(f"FRED returned malformed observations for {spec.series_id}.")
+            records = [
+                {"date": observation.get("date"), "value": observation.get("value")}
+                for observation in observations
+            ]
+            frame = pd.DataFrame.from_records(records)
             if frame.empty:
                 raise FREDDataError(f"FRED returned no observations for {spec.series_id}.")
             date_values = cast(pd.Series, frame.loc[:, "date"])
@@ -95,6 +110,7 @@ class FREDClient:
             series = cast(pd.Series, frame.dropna().set_index("date").loc[:, "value"]).copy()
             series = series.loc[series.index.notna()].sort_index().groupby(level=0).last()
             series.name = spec.series_id
+            series = self._drop_incomplete_period(series, spec)
             series = self._apply_observation_start(series, observation_start)
             if not self._has_expected_cadence(series, spec):
                 raise FREDDataError(
@@ -108,7 +124,15 @@ class FREDClient:
                 series, cached_window, spec
             ):
                 return cached_window, True
-            self._write_cache(series, cache_file)
+            cache_series = series
+            if cached is not None:
+                # A caller can request a later observation window than the cache contains.
+                # Preserve out-of-window history while allowing FRED revisions to replace
+                # observations returned by the current request.
+                cached_history = cached.loc[~cached.index.isin(series.index)]
+                cache_series = pd.concat([cached_history, series]).sort_index()
+                cache_series.name = spec.series_id
+            self._write_cache(cache_series, cache_file, spec)
             return series, False
         except (httpx.HTTPError, ValueError, KeyError, FREDDataError) as exc:
             cached = self._read_cache(cache_file, spec)
@@ -181,10 +205,9 @@ class FREDClient:
     def _apply_observation_start(series: pd.Series, observation_start: str) -> pd.Series:
         try:
             parsed = pd.DatetimeIndex([observation_start])
-            cutoff_timestamp = cast(pd.Timestamp, parsed[0])
-            if pd.isna(cutoff_timestamp):
+            if parsed.isna().any():
                 raise ValueError("observation start is not a date")
-            cutoff = cutoff_timestamp.to_period("M").to_timestamp()
+            cutoff = cast(pd.Timestamp, parsed.to_period("M").to_timestamp()[0])
         except (TypeError, ValueError) as exc:
             raise FREDDataError(f"Invalid observation start: {observation_start}") from exc
         result = series.loc[series.index >= cutoff]
@@ -194,7 +217,7 @@ class FREDClient:
             )
         return result
 
-    def _write_cache(self, series: pd.Series, path: Path) -> None:
+    def _write_cache(self, series: pd.Series, path: Path, spec: SeriesSpec) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -206,7 +229,14 @@ class FREDClient:
                 delete=False,
             ) as temporary:
                 temporary_path = Path(temporary.name)
-                series.to_frame(name="value").to_csv(temporary, index_label="date")
+                frame = series.to_frame(name="value")
+                if spec.fred_frequency is not None:
+                    frame["fred_frequency"] = spec.fred_frequency
+                if spec.fred_aggregation_method is not None:
+                    frame["fred_aggregation_method"] = spec.fred_aggregation_method
+                if spec.exclude_incomplete_period:
+                    frame["complete_periods_only"] = True
+                frame.to_csv(temporary, index_label="date")
             os.replace(temporary_path, path)
         finally:
             if temporary_path is not None and temporary_path.exists():
@@ -220,15 +250,38 @@ class FREDClient:
         return parsed.dt.to_period("M").dt.to_timestamp()
 
     @staticmethod
+    def _drop_incomplete_period(
+        series: pd.Series,
+        spec: SeriesSpec,
+        *,
+        now: object | None = None,
+    ) -> pd.Series:
+        """Exclude a still-forming aggregate such as the current month's daily average."""
+
+        if not spec.exclude_incomplete_period or series.empty:
+            return series
+        reference_index = pd.DatetimeIndex([pd.Timestamp.now(tz="UTC") if now is None else now])
+        if reference_index.isna().any():
+            raise ValueError("The current timestamp is invalid.")
+        if reference_index.tz is not None:
+            reference_index = reference_index.tz_convert("UTC").tz_localize(None)
+        current_period_start = cast(pd.Timestamp, reference_index.to_period("M").to_timestamp()[0])
+        return series.loc[series.index < current_period_start]
+
+    @staticmethod
     def _has_expected_cadence(series: pd.Series, spec: SeriesSpec) -> bool:
         if series.empty:
             return False
         index = pd.DatetimeIndex(series.index)
         if not index.is_monotonic_increasing or not index.is_unique:
             return False
-        frequency = "MS" if spec.frequency == "monthly" else "3MS"
-        expected = pd.date_range(index[0], index[-1], freq=frequency)
-        return index.equals(expected)
+        if spec.frequency == "quarterly":
+            month_ordinals = index.to_period("M").asi8.tolist()
+            return all(ordinal % 3 == 2 for ordinal in month_ordinals) and all(
+                (right - left) % 3 == 0
+                for left, right in zip(month_ordinals, month_ordinals[1:], strict=False)
+            )
+        return True
 
     @classmethod
     def _can_replace_cache(cls, candidate: pd.Series, cached: pd.Series, spec: SeriesSpec) -> bool:
@@ -256,6 +309,16 @@ class FREDClient:
             return None
         if not {"date", "value"}.issubset(frame.columns):
             return None
+        contract = {
+            "fred_frequency": spec.fred_frequency,
+            "fred_aggregation_method": spec.fred_aggregation_method,
+            "complete_periods_only": True if spec.exclude_incomplete_period else None,
+        }
+        for column, expected in contract.items():
+            if expected is not None and (
+                column not in frame or not (frame[column] == expected).all()
+            ):
+                return None
         raw_values = cast(pd.Series, frame.loc[:, "value"])
         raw_dates = cast(pd.Series, frame.loc[:, "date"])
         values = cast(pd.Series, pd.to_numeric(raw_values, errors="coerce"))
@@ -267,6 +330,7 @@ class FREDClient:
         if series.empty:
             return None
         series = series.groupby(level=0).last()
-        if not cls._has_expected_cadence(series, spec):
+        series = cls._drop_incomplete_period(series, spec)
+        if series.empty or not cls._has_expected_cadence(series, spec):
             return None
         return series
