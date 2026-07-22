@@ -467,7 +467,10 @@ select {
 }
 
 .workspace-quick-start {
-	justify-content: flex-end;
+	align-items: center;
+	display: flex;
+	gap: 1rem;
+	justify-content: space-between;
 	margin-bottom: 0.65rem;
 	padding-inline: 0.2rem;
 }
@@ -805,21 +808,39 @@ select {
 	height: 0.55rem;
 }
 
-.legend-scenario {
-	background: var(--scenario);
+.legend-scenario-0 {
+	background: #ff8f5c;
 }
 
-.legend-scenario-band {
+.legend-scenario-0-band {
 	background: rgba(255, 143, 92, 0.22);
 	height: 0.55rem;
 }
 
-.legend-comparison {
+.legend-scenario-1 {
 	background: #a78bfa;
 }
 
-.legend-comparison-band {
+.legend-scenario-1-band {
 	background: rgba(167, 139, 250, 0.2);
+	height: 0.55rem;
+}
+
+.legend-scenario-2 {
+	background: #fbbf24;
+}
+
+.legend-scenario-2-band {
+	background: rgba(251, 191, 36, 0.2);
+	height: 0.55rem;
+}
+
+.legend-scenario-3 {
+	background: #60a5fa;
+}
+
+.legend-scenario-3-band {
+	background: rgba(96, 165, 250, 0.2);
 	height: 0.55rem;
 }
 
@@ -1576,6 +1597,112 @@ select {
 	font-size: 0.57rem;
 	font-weight: 650;
 	white-space: nowrap;
+}
+
+/* The status pane is deliberately one fixed-height navigation row. */
+.status-bar {
+	flex-wrap: nowrap;
+	height: 4.5rem;
+	min-height: 4.5rem;
+	overflow-x: auto;
+	overflow-y: hidden;
+}
+
+.status-copy {
+	flex: 0 0 auto;
+}
+
+.status-controls {
+	flex: 0 0 auto;
+	margin-left: auto;
+}
+
+.scenario-actions,
+.scenario-switcher {
+	flex-wrap: nowrap;
+	min-width: 0;
+	white-space: nowrap;
+}
+
+.scenario-manager .shiny-input-container {
+	width: 8rem;
+}
+
+.scenario-visibility .shiny-input-container,
+.scenario-interval-toggle .shiny-input-container {
+	margin: 0;
+	width: auto;
+}
+
+.scenario-visibility .shiny-options-group {
+	display: flex;
+	gap: 0.3rem;
+}
+
+.scenario-visibility .checkbox,
+.scenario-interval-toggle .checkbox {
+	margin: 0;
+}
+
+.scenario-visibility .checkbox label,
+.scenario-interval-toggle .checkbox label {
+	align-items: center;
+	border: 1px solid var(--line-strong);
+	border-radius: 999px;
+	color: var(--muted);
+	display: flex;
+	font-size: 0.65rem;
+	font-weight: 750;
+	gap: 0.28rem;
+	min-height: 2.1rem;
+	padding: 0.35rem 0.55rem;
+}
+
+.scenario-visibility .checkbox label {
+	max-width: 6rem;
+}
+
+.scenario-visibility .checkbox label span {
+	display: block;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.scenario-visibility input,
+.scenario-interval-toggle input {
+	accent-color: var(--accent);
+	margin: 0;
+}
+
+.scenario-visibility .checkbox:nth-child(1):has(input:checked) label {
+	background: rgba(255, 143, 92, 0.12);
+	border-color: rgba(255, 143, 92, 0.48);
+	color: #ffb18d;
+}
+
+.scenario-visibility .checkbox:nth-child(2):has(input:checked) label {
+	background: rgba(167, 139, 250, 0.11);
+	border-color: rgba(167, 139, 250, 0.45);
+	color: #c4b5fd;
+}
+
+.scenario-visibility .checkbox:nth-child(3):has(input:checked) label {
+	background: rgba(251, 191, 36, 0.1);
+	border-color: rgba(251, 191, 36, 0.45);
+	color: #fcd34d;
+}
+
+.scenario-visibility .checkbox:nth-child(4):has(input:checked) label {
+	background: rgba(96, 165, 250, 0.1);
+	border-color: rgba(96, 165, 250, 0.45);
+	color: #93c5fd;
+}
+
+.scenario-interval-toggle .checkbox:has(input:checked) label {
+	background: var(--accent-soft);
+	border-color: rgba(94, 234, 212, 0.42);
+	color: var(--accent);
 }
 
 .btn-scenario {
@@ -2496,31 +2623,6 @@ select {
 		min-width: min(100%, 280px);
 	}
 
-	.status-bar {
-		align-items: stretch;
-		flex-direction: column;
-		position: static;
-	}
-
-	.status-controls {
-		align-items: flex-start;
-		flex-wrap: wrap;
-		justify-content: space-between;
-	}
-
-	.model-stats {
-		flex-wrap: wrap;
-	}
-
-	.scenario-actions {
-		flex-wrap: wrap;
-	}
-
-	.scenario-switcher {
-		align-items: flex-start;
-		flex-direction: column;
-	}
-
 	.workspace-toolbar {
 		align-items: stretch;
 		flex-direction: column;
@@ -2587,20 +2689,6 @@ select {
 
 	.artifact-badge {
 		width: 100%;
-	}
-
-	.status-copy {
-		align-items: stretch;
-		flex-direction: column;
-	}
-
-	.model-stats {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-	}
-
-	.model-stat {
-		justify-content: space-between;
 	}
 
 	.variable-library-list {

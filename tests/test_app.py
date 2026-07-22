@@ -11,6 +11,7 @@ import pytest
 from us_bvar.artifact import ForecastArtifact
 from us_bvar.config import SERIES_SPECS
 from us_bvar.dashboard import (
+    MAX_SAVED_SCENARIOS,
     DashboardRuntime,
     NamedScenario,
     build_ui,
@@ -216,6 +217,22 @@ def test_named_scenarios_enforce_compact_unique_names(
     assert duplicate_name == f"{'A' * 53} copy 2"
     assert len(duplicate_name) == 60
 
+    at_capacity = {
+        str(index): NamedScenario(str(index), f"Scenario {index + 1}", dashboard_runtime.baseline)
+        for index in range(MAX_SAVED_SCENARIOS)
+    }
+    with pytest.raises(ValueError, match="at most 4 scenarios"):
+        save_named_scenario(
+            at_capacity,
+            NamedScenario("fifth", "Scenario 5", dashboard_runtime.baseline),
+        )
+    replacement = save_named_scenario(
+        at_capacity,
+        NamedScenario("0", "Renamed scenario", dashboard_runtime.baseline),
+    )
+    assert len(replacement) == MAX_SAVED_SCENARIOS
+    assert replacement["0"].name == "Renamed scenario"
+
 
 @pytest.mark.parametrize(
     ("entered", "expected"),
@@ -243,15 +260,24 @@ def test_scenario_switcher_lists_saved_names(dashboard_runtime: DashboardRuntime
         "second": NamedScenario("second", "Oil shock", forecast),
     }
 
-    rendered = str(scenario_switcher(scenarios, "second", "first"))
+    rendered = str(
+        scenario_switcher(
+            scenarios,
+            "second",
+            ("first",),
+            show_intervals=True,
+        )
+    )
 
     assert 'id="active_scenario"' in rendered
     assert '<option value="first">Soft landing</option>' in rendered
     assert '<option value="second" selected="">Oil shock</option>' in rendered
-    assert 'id="comparison_scenario"' in rendered
-    assert '<option value="first" selected="">Soft landing</option>' in rendered
-    assert "2 scenarios in this session" in rendered
-    assert "Scenarios reset when this session ends" in rendered
+    assert 'id="comparison_scenario"' not in rendered
+    assert 'id="visible_scenarios"' in rendered
+    assert 'value="first" checked="checked"' in rendered
+    assert 'value="second" checked="checked"' not in rendered
+    assert 'id="show_intervals"' in rendered
+    assert 'id="show_intervals" type="checkbox" checked="checked"' in rendered
     assert 'class="scenario-export"' in rendered
     assert 'data-scenario-name="Oil shock"' in rendered
     assert "schema_version" in rendered
@@ -284,6 +310,8 @@ def test_scenario_flow_and_progress_are_present_in_generated_ui(
     assert 'id="delete_scenario"' in rendered
     stylesheet = (Path(__file__).parents[1] / "www/app.css").read_text()
     assert "scenario-progress-overlay" in stylesheet
+    assert "height: 4.5rem" in stylesheet
+    assert "flex-wrap: nowrap" in stylesheet
     assert "height: calc(100dvh - 2rem)" in stylesheet
     assert ".scenario-assumption-summary" in stylesheet
     assert ".scenario-validation-message" in stylesheet

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -13,6 +14,14 @@ from us_bvar.transforms import (
     transform_forecast_samples,
     transform_path,
     transformation_spec,
+)
+
+ScenarioForecast = tuple[str, ForecastResult, int]
+SCENARIO_STYLES: tuple[tuple[str, str], ...] = (
+    ("#ff8f5c", "rgba(255, 143, 92, 0.12)"),
+    ("#a78bfa", "rgba(167, 139, 250, 0.10)"),
+    ("#fbbf24", "rgba(251, 191, 36, 0.10)"),
+    ("#60a5fa", "rgba(96, 165, 250, 0.10)"),
 )
 
 
@@ -93,11 +102,12 @@ def _forecast_table_frame(
     history: pd.DataFrame,
     baseline: ForecastResult,
     specs: tuple[SeriesSpec, ...],
-    scenario: ForecastResult | None = None,
-    comparison: ForecastResult | None = None,
+    scenarios: Sequence[ScenarioForecast] = (),
+    *,
+    show_intervals: bool = True,
     history_months: int = 6,
 ) -> pd.DataFrame:
-    """Build display-ready cells while keeping the public data frame numeric."""
+    """Build display-ready cells for the baseline and every visible scenario."""
 
     recent = history.tail(history_months)
     display_dates = pd.DatetimeIndex(recent.index.append(baseline.dates))
@@ -122,50 +132,37 @@ def _forecast_table_frame(
         spec: SeriesSpec,
         forecast: ForecastResult,
     ) -> str:
+        median = (
+            f'<span class="table-value forecast-median">{_format_table_value(value, spec)}</span>'
+        )
+        if not show_intervals:
+            return median
         interval = f"{_format_table_value(lower, spec)} – {_format_table_value(upper, spec)}"
         return (
-            f'<span class="table-value forecast-median">'
-            f"{_format_table_value(value, spec)}</span>"
-            f'<span class="forecast-interval" title="{interval_label(forecast)}">'
+            median + f'<span class="forecast-interval" title="{interval_label(forecast)}">'
             f"{interval_range_label(forecast)}: {interval}</span>"
         )
 
+    forecasts: tuple[tuple[str, ForecastResult], ...] = (
+        ("baseline", baseline),
+        *(
+            (f"scenario_{index}", forecast)
+            for index, (_name, forecast, _color) in enumerate(scenarios)
+        ),
+    )
     for spec in specs:
         historical_cells = [value_cell(value, spec) for value in recent[spec.series_id]]
-        baseline_cells = [
-            forecast_cell(value, lower, upper, spec, baseline)
-            for value, lower, upper in zip(
-                baseline.median[spec.series_id],
-                baseline.lower[spec.series_id],
-                baseline.upper[spec.series_id],
-                strict=True,
-            )
-        ]
-        result[f"{spec.series_id}_baseline"] = historical_cells + baseline_cells
-
-        if scenario is not None:
-            scenario_cells = [
-                forecast_cell(value, lower, upper, spec, scenario)
+        for suffix, forecast in forecasts:
+            forecast_cells = [
+                forecast_cell(value, lower, upper, spec, forecast)
                 for value, lower, upper in zip(
-                    scenario.median[spec.series_id],
-                    scenario.lower[spec.series_id],
-                    scenario.upper[spec.series_id],
+                    forecast.median[spec.series_id],
+                    forecast.lower[spec.series_id],
+                    forecast.upper[spec.series_id],
                     strict=True,
                 )
             ]
-            result[f"{spec.series_id}_scenario"] = historical_cells + scenario_cells
-
-        if comparison is not None:
-            comparison_cells = [
-                forecast_cell(value, lower, upper, spec, comparison)
-                for value, lower, upper in zip(
-                    comparison.median[spec.series_id],
-                    comparison.lower[spec.series_id],
-                    comparison.upper[spec.series_id],
-                    strict=True,
-                )
-            ]
-            result[f"{spec.series_id}_comparison"] = historical_cells + comparison_cells
+            result[f"{spec.series_id}_{suffix}"] = historical_cells + forecast_cells
 
     return result
 
@@ -174,22 +171,24 @@ def forecast_gt(
     history: pd.DataFrame,
     baseline: ForecastResult,
     specs: tuple[SeriesSpec, ...],
-    scenario: ForecastResult | None = None,
+    scenarios: Sequence[ScenarioForecast] = (),
     *,
-    scenario_name: str | None = None,
-    comparison: ForecastResult | None = None,
-    comparison_name: str | None = None,
+    show_intervals: bool = True,
 ) -> GT:
-    frame = _forecast_table_frame(history, baseline, specs, scenario, comparison)
+    frame = _forecast_table_frame(
+        history,
+        baseline,
+        specs,
+        scenarios,
+        show_intervals=show_intervals,
+    )
     value_columns = [column for column in frame if column not in {"Month", "Period"}]
+    subtitle = "Natural units · forecast cells show medians"
+    if show_intervals:
+        subtitle += f" and {interval_label(baseline)}"
     table = (
         GT(frame)
-        .tab_header(
-            title="Monthly history and forecast",
-            subtitle=(
-                f"Natural units · forecast cells show the median and {interval_label(baseline)}"
-            ),
-        )
+        .tab_header(title="Monthly history and forecast", subtitle=subtitle)
         .tab_source_note(
             source_note=md(
                 "**Source:** FRED and model estimates. Monthly GDP history is a latent estimate; "
@@ -209,17 +208,11 @@ def forecast_gt(
     )
     for spec in specs:
         columns = [f"{spec.series_id}_baseline"]
-        scenario_column = f"{spec.series_id}_scenario"
-        if scenario_column in frame:
-            columns.append(scenario_column)
-        comparison_column = f"{spec.series_id}_comparison"
-        if comparison_column in frame:
-            columns.append(comparison_column)
         labels = {columns[0]: "Baseline"}
-        if scenario_column in frame:
-            labels[scenario_column] = scenario_name or "Scenario"
-        if comparison_column in frame:
-            labels[comparison_column] = comparison_name or "Comparison"
+        for index, (name, _forecast, _color) in enumerate(scenarios):
+            column = f"{spec.series_id}_scenario_{index}"
+            columns.append(column)
+            labels[column] = name
         table = table.cols_label(cases=cast(dict[str, Any], labels)).tab_spanner(
             label=html(
                 f'<span class="variable-name">{spec.short_label}</span>'
@@ -253,12 +246,10 @@ def echarts_options(
     history: pd.DataFrame,
     baseline: ForecastResult,
     spec: SeriesSpec,
-    scenario: ForecastResult | None = None,
+    scenarios: Sequence[ScenarioForecast] = (),
     transformation: PlotTransformation = "level",
     *,
-    scenario_name: str | None = None,
-    comparison: ForecastResult | None = None,
-    comparison_name: str | None = None,
+    show_intervals: bool = True,
 ) -> dict[str, Any]:
     """Build a local Apache ECharts configuration for one model variable."""
 
@@ -273,21 +264,27 @@ def echarts_options(
     def point(date: object, value: object) -> list[float]:
         return [_timestamp_milliseconds(date), _rounded_chart_value(value)]
 
+    def band_data(
+        forecast: ForecastResult,
+        forecast_lower: pd.Series,
+        forecast_upper: pd.Series,
+    ) -> list[list[float]]:
+        return [
+            [last_point[0], last_point[1], last_point[1]],
+            *[
+                [
+                    _timestamp_milliseconds(date),
+                    _rounded_chart_value(forecast_lower.loc[date]),
+                    _rounded_chart_value(forecast_upper.loc[date]),
+                ]
+                for date in forecast.dates
+            ],
+        ]
+
     historical = [point(date, value) for date, value in recent.items()]
     last_point = point(recent.index[-1], recent.iloc[-1])
     baseline_line = [last_point] + [
         point(date, baseline_median.loc[date]) for date in baseline.dates
-    ]
-    interval = [
-        [last_point[0], last_point[1], last_point[1]],
-        *[
-            [
-                _timestamp_milliseconds(date),
-                _rounded_chart_value(lower.loc[date]),
-                _rounded_chart_value(upper.loc[date]),
-            ]
-            for date in baseline.dates
-        ],
     ]
     series: list[dict[str, Any]] = [
         {
@@ -310,43 +307,30 @@ def echarts_options(
             "z": 3,
         },
     ]
-    bands = [
-        {
-            "name": f"Baseline {interval_label(baseline)}",
-            "data": interval,
-            "color": "rgba(54, 214, 189, 0.16)",
-        }
-    ]
+    bands: list[dict[str, Any]] = []
+    if show_intervals:
+        bands.append(
+            {
+                "name": f"Baseline {interval_label(baseline)}",
+                "data": band_data(baseline, lower, upper),
+                "color": "rgba(54, 214, 189, 0.16)",
+            }
+        )
 
-    def add_scenario(
-        forecast: ForecastResult,
-        label: str,
-        *,
-        line_color: str,
-        band_color: str,
-        z_index: int,
-    ) -> None:
+    for index, (label, forecast, color_index) in enumerate(scenarios[: len(SCENARIO_STYLES)]):
+        line_color, band_color = SCENARIO_STYLES[color_index % len(SCENARIO_STYLES)]
         median, forecast_lower, forecast_upper = forecast_summary_on_scale(
             history_series, forecast, spec, transformation
         )
         line = [last_point] + [point(date, median.loc[date]) for date in forecast.dates]
-        bands.append(
-            {
-                "name": f"{label} {interval_label(forecast)}",
-                "data": [
-                    [last_point[0], last_point[1], last_point[1]],
-                    *[
-                        [
-                            _timestamp_milliseconds(date),
-                            _rounded_chart_value(forecast_lower.loc[date]),
-                            _rounded_chart_value(forecast_upper.loc[date]),
-                        ]
-                        for date in forecast.dates
-                    ],
-                ],
-                "color": band_color,
-            }
-        )
+        if show_intervals:
+            bands.append(
+                {
+                    "name": f"{label} {interval_label(forecast)}",
+                    "data": band_data(forecast, forecast_lower, forecast_upper),
+                    "color": band_color,
+                }
+            )
         series.append(
             {
                 "name": label,
@@ -355,25 +339,8 @@ def echarts_options(
                 "showSymbol": False,
                 "lineStyle": {"color": line_color, "width": 3},
                 "itemStyle": {"color": line_color},
-                "z": z_index,
+                "z": 5 + index,
             }
-        )
-
-    if scenario is not None:
-        add_scenario(
-            scenario,
-            scenario_name or "Scenario",
-            line_color="#ff8f5c",
-            band_color="rgba(255, 143, 92, 0.12)",
-            z_index=5,
-        )
-    if comparison is not None:
-        add_scenario(
-            comparison,
-            comparison_name or "Comparison",
-            line_color="#a78bfa",
-            band_color="rgba(167, 139, 250, 0.10)",
-            z_index=6,
         )
 
     return {

@@ -61,6 +61,7 @@ POSTERIOR_DRAWS = 400
 SCENARIO_CACHE_SIZE = 32
 MAX_SCENARIO_NAME_LENGTH = 60
 MAX_SCENARIO_CONSTRAINTS = 60
+MAX_SAVED_SCENARIOS = 4
 MAX_SCENARIO_VALUE = 1_000_000_000.0
 SCENARIO_NUMBER_PATTERN = re.compile(
     r"^[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"
@@ -155,6 +156,8 @@ def save_named_scenario(
     normalized_name = validate_scenario_name(
         scenarios, scenario.name, scenario_id=scenario.scenario_id
     )
+    if scenario.scenario_id not in scenarios and len(scenarios) >= MAX_SAVED_SCENARIOS:
+        raise ValueError(f"Save at most {MAX_SAVED_SCENARIOS} scenarios per session.")
     updated = dict(scenarios)
     updated[scenario.scenario_id] = NamedScenario(
         scenario_id=scenario.scenario_id,
@@ -455,12 +458,6 @@ def build_ui(runtime) -> ui.Tag:
                 class_="status-copy",
             ),
             ui.div(
-                ui.tags.nav(
-                    ui.tags.a("Series", href="#analysis-workspace"),
-                    ui.tags.a("Forecast data", href="#forecast-data"),
-                    class_="section-navigation",
-                    aria_label="Dashboard sections",
-                ),
                 ui.div(
                     ui.output_ui("scenario_summary"),
                     ui.input_action_button("open_scenario", "New scenario", class_="btn-scenario"),
@@ -490,6 +487,12 @@ def build_ui(runtime) -> ui.Tag:
             else None
         ),
         ui.tags.section(
+            ui.tags.nav(
+                ui.tags.a("Series", href="#analysis-workspace"),
+                ui.tags.a("Forecast data", href="#forecast-data"),
+                class_="section-navigation",
+                aria_label="Dashboard sections",
+            ),
             ui.div(
                 ui.span("QUICK START", class_="preset-label"),
                 ui.div(
@@ -503,8 +506,11 @@ def build_ui(runtime) -> ui.Tag:
                     ),
                     class_="workspace-presets",
                 ),
-                class_="preset-group workspace-quick-start",
+                class_="preset-group",
             ),
+            class_="workspace-quick-start",
+        ),
+        ui.tags.section(
             ui.div(
                 ui.tags.aside(
                     ui.div(
@@ -960,77 +966,68 @@ def scenario_modal(
 def scenario_switcher(
     scenarios: dict[str, NamedScenario],
     active_scenario_id: str | None,
-    comparison_scenario_id: str | None = None,
+    visible_scenario_ids: tuple[str, ...] = (),
+    *,
+    show_intervals: bool = False,
 ) -> ui.Tag:
     if not scenarios:
         return ui.div(ui.span(class_="scenario-dot"), "Baseline", class_="scenario-chip")
 
-    choices = {"": "Baseline"}
-    choices.update({scenario_id: scenario.name for scenario_id, scenario in scenarios.items()})
-    saved_label = (
-        "1 scenario in this session"
-        if len(scenarios) == 1
-        else f"{len(scenarios)} scenarios in this session"
+    active_id = active_scenario_id if active_scenario_id in scenarios else next(iter(scenarios))
+    active = scenarios[active_id]
+    choices = {scenario_id: scenario.name for scenario_id, scenario in scenarios.items()}
+    selected_visible = [
+        scenario_id for scenario_id in scenarios if scenario_id in visible_scenario_ids
+    ]
+    export_payload = json.dumps(
+        {
+            "schema_version": 1,
+            "name": active.name,
+            "constraints": [
+                {
+                    "date": str(active.forecast.dates[step])[:10],
+                    "series_id": series_id,
+                    "value": constraint.value,
+                    "transformation": constraint.transformation,
+                }
+                for (step, series_id), constraint in sorted(active.forecast.constraints.items())
+            ],
+        },
+        separators=(",", ":"),
     )
-    active = scenarios.get(active_scenario_id or "")
-    comparison_choices = {
-        scenario_id: scenario.name
-        for scenario_id, scenario in scenarios.items()
-        if scenario_id != active_scenario_id
-    }
-    export_payload = None
-    if active is not None:
-        export_payload = json.dumps(
-            {
-                "schema_version": 1,
-                "name": active.name,
-                "constraints": [
-                    {
-                        "date": str(active.forecast.dates[step])[:10],
-                        "series_id": series_id,
-                        "value": constraint.value,
-                        "transformation": constraint.transformation,
-                    }
-                    for (step, series_id), constraint in sorted(active.forecast.constraints.items())
-                ],
-            },
-            separators=(",", ":"),
-        )
     return ui.div(
-        ui.input_select(
-            "active_scenario",
-            None,
-            choices=choices,
-            selected=active_scenario_id or "",
+        ui.div(
+            ui.span("Manage", class_="visually-hidden"),
+            ui.input_select("active_scenario", None, choices=choices, selected=active_id),
+            class_="scenario-manager",
+            title="Scenario used by Edit, Duplicate, Export, and Delete",
         ),
-        ui.span(
-            saved_label,
-            class_="scenario-saved-count",
-            title="Scenarios reset when this session ends",
-        ),
-        (
-            ui.input_select(
-                "comparison_scenario",
+        ui.div(
+            ui.input_checkbox_group(
+                "visible_scenarios",
                 None,
-                choices={"": "Compare with…", **comparison_choices},
-                selected=(
-                    comparison_scenario_id if comparison_scenario_id in comparison_choices else ""
-                ),
-            )
-            if active is not None and comparison_choices
-            else None
+                choices=choices,
+                selected=selected_visible,
+            ),
+            class_="scenario-visibility",
+            aria_label="Scenarios shown on charts",
         ),
-        (
-            ui.tags.button(
-                "Export",
-                type="button",
-                class_="scenario-export",
-                data_scenario_export=export_payload,
-                data_scenario_name=active.name,
-                title="Download this scenario's assumptions as JSON",
-            )
-            if active is not None
-            else None
+        ui.div(
+            ui.input_checkbox(
+                "show_intervals",
+                "All CIs",
+                value=show_intervals,
+            ),
+            class_="scenario-interval-toggle",
+            title="Show confidence intervals for the baseline and visible scenarios",
+        ),
+        ui.tags.button(
+            "Export",
+            type="button",
+            class_="scenario-export",
+            data_scenario_export=export_payload,
+            data_scenario_name=active.name,
+            title=f'Download "{active.name}" assumptions as JSON',
         ),
         class_="scenario-switcher",
     )
@@ -1039,7 +1036,8 @@ def scenario_switcher(
 def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     scenarios_state: reactive.Value[dict[str, NamedScenario]] = reactive.Value({})
     active_scenario_id: reactive.Value[str | None] = reactive.Value(None)
-    comparison_scenario_id: reactive.Value[str | None] = reactive.Value(None)
+    visible_scenario_ids: reactive.Value[tuple[str, ...]] = reactive.Value(())
+    show_intervals_state: reactive.Value[bool] = reactive.Value(False)
     scenario_validation_message: reactive.Value[str] = reactive.Value("")
     session_id = token_hex(8)
     session_started_at = perf_counter()
@@ -1075,9 +1073,17 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         scenario_id = active_scenario_id.get()
         return scenarios_state.get().get(scenario_id) if scenario_id else None
 
-    def _comparison_named_scenario() -> NamedScenario | None:
-        scenario_id = comparison_scenario_id.get()
-        return scenarios_state.get().get(scenario_id) if scenario_id else None
+    def _visible_named_scenarios() -> tuple[tuple[int, NamedScenario], ...]:
+        scenarios = scenarios_state.get()
+        visible_ids = set(visible_scenario_ids.get())
+        return tuple(
+            (index, scenario)
+            for index, (scenario_id, scenario) in enumerate(scenarios.items())
+            if scenario_id in visible_ids
+        )
+
+    def _intervals_visible() -> bool:
+        return not scenarios_state.get() or show_intervals_state.get()
 
     @reactive.calc
     def _visible_specs() -> tuple[SeriesSpec, ...]:
@@ -1142,7 +1148,8 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         return scenario_switcher(
             scenarios_state.get(),
             active_scenario_id.get(),
-            comparison_scenario_id.get(),
+            visible_scenario_ids.get(),
+            show_intervals=show_intervals_state.get(),
         )
 
     @output
@@ -1162,47 +1169,47 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     def _select_scenario() -> None:
         selected = str(input.active_scenario() or "")
         active_scenario_id.set(selected if selected in scenarios_state.get() else None)
-        if selected == comparison_scenario_id.get() or not selected:
-            comparison_scenario_id.set(None)
 
     @reactive.effect
-    @reactive.event(input.comparison_scenario)
-    def _select_comparison_scenario() -> None:
-        selected = str(input.comparison_scenario() or "")
-        valid = selected in scenarios_state.get() and selected != active_scenario_id.get()
-        comparison_scenario_id.set(selected if valid else None)
+    @reactive.event(input.visible_scenarios)
+    def _select_visible_scenarios() -> None:
+        raw = input.visible_scenarios()
+        selected = {raw} if isinstance(raw, str) else set(raw or ())
+        visible_scenario_ids.set(
+            tuple(scenario_id for scenario_id in scenarios_state.get() if scenario_id in selected)
+        )
+
+    @reactive.effect
+    @reactive.event(input.show_intervals)
+    def _select_interval_visibility() -> None:
+        show_intervals_state.set(bool(input.show_intervals()))
 
     @reactive.effect
     def _sync_scenario_actions() -> None:
+        scenarios = scenarios_state.get()
         has_active_scenario = _active_named_scenario() is not None
+        at_capacity = len(scenarios) >= MAX_SAVED_SCENARIOS
+        ui.update_action_button("open_scenario", disabled=at_capacity)
         ui.update_action_button("edit_scenario", disabled=not has_active_scenario)
-        ui.update_action_button("duplicate_scenario", disabled=not has_active_scenario)
+        ui.update_action_button(
+            "duplicate_scenario", disabled=not has_active_scenario or at_capacity
+        )
         ui.update_action_button("delete_scenario", disabled=not has_active_scenario)
 
     @output
     @render.ui
     def workspace_legend() -> ui.Tag:
+        show_intervals = _intervals_visible()
         items = [
             ("history", "History / estimate"),
             ("baseline", "Baseline median"),
-            ("baseline-band", "Baseline interval"),
         ]
-        active = _active_named_scenario()
-        comparison = _comparison_named_scenario()
-        if active is not None:
-            items.extend(
-                [
-                    ("scenario", f"{active.name} median"),
-                    ("scenario-band", f"{active.name} interval"),
-                ]
-            )
-        if comparison is not None:
-            items.extend(
-                [
-                    ("comparison", f"{comparison.name} median"),
-                    ("comparison-band", f"{comparison.name} interval"),
-                ]
-            )
+        if show_intervals:
+            items.append(("baseline-band", "Baseline interval"))
+        for color_index, scenario in _visible_named_scenarios():
+            items.append((f"scenario-{color_index}", f"{scenario.name} median"))
+            if show_intervals:
+                items.append((f"scenario-{color_index}-band", f"{scenario.name} interval"))
         return ui.div(
             *[
                 ui.span(
@@ -1220,8 +1227,10 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         @output(id=f"chart_{chart_spec.series_id}", suspend_when_hidden=True)
         @render.ui
         def _chart():
-            active = _active_named_scenario()
-            comparison = _comparison_named_scenario()
+            visible_scenarios = tuple(
+                (scenario.name, scenario.forecast, color_index)
+                for color_index, scenario in _visible_named_scenarios()
+            )
             raw_transformation = input[f"plot_transform_{chart_spec.series_id}"]()
             transformation: PlotTransformation = (
                 raw_transformation if raw_transformation in PLOT_TRANSFORMATIONS else "level"
@@ -1231,11 +1240,9 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
                     runtime.history,
                     runtime.baseline,
                     chart_spec,
-                    active.forecast if active else None,
+                    visible_scenarios,
                     transformation,
-                    scenario_name=active.name if active else None,
-                    comparison=comparison.forecast if comparison else None,
-                    comparison_name=comparison.name if comparison else None,
+                    show_intervals=_intervals_visible(),
                 ),
                 separators=(",", ":"),
             ).replace("</", "<\\/")
@@ -1252,16 +1259,16 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     @output
     @render.ui
     def forecast_table():
-        active = _active_named_scenario()
-        comparison = _comparison_named_scenario()
+        visible_scenarios = tuple(
+            (scenario.name, scenario.forecast, color_index)
+            for color_index, scenario in _visible_named_scenarios()
+        )
         table = forecast_gt(
             runtime.history,
             runtime.baseline,
             _visible_specs(),
-            active.forecast if active else None,
-            scenario_name=active.name if active else None,
-            comparison=comparison.forecast if comparison else None,
-            comparison_name=comparison.name if comparison else None,
+            visible_scenarios,
+            show_intervals=_intervals_visible(),
         )
         return ui.HTML(table.as_raw_html())
 
@@ -1269,6 +1276,13 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
     @reactive.event(input.open_scenario)
     def _open_scenario() -> None:
         nonlocal editor_scenario_id, next_scenario_number
+        if len(scenarios_state.get()) >= MAX_SAVED_SCENARIOS:
+            ui.notification_show(
+                f"Delete a scenario before creating another (maximum {MAX_SAVED_SCENARIOS}).",
+                type="warning",
+                duration=5,
+            )
+            return
         editor_scenario_id = None
         scenario_validation_message.set("")
         scenario_name, next_scenario_number = default_scenario_name(
@@ -1293,6 +1307,13 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         nonlocal editor_scenario_id
         active = _active_named_scenario()
         if active is None:
+            return
+        if len(scenarios_state.get()) >= MAX_SAVED_SCENARIOS:
+            ui.notification_show(
+                f"Delete a scenario before duplicating another (maximum {MAX_SAVED_SCENARIOS}).",
+                type="warning",
+                duration=5,
+            )
             return
         editor_scenario_id = None
         scenario_validation_message.set("")
@@ -1319,6 +1340,8 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         pending_creates_scenario = False
         constraints: dict[tuple[int, str], ScenarioConstraint] = {}
         try:
+            if editor_scenario_id is None and len(scenarios_state.get()) >= MAX_SAVED_SCENARIOS:
+                raise ValueError(f"Save at most {MAX_SAVED_SCENARIOS} scenarios per session.")
             scenario_name = validate_scenario_name(
                 scenarios_state.get(),
                 input.scenario_name(),
@@ -1402,6 +1425,7 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
             scenarios_state.set(saved_scenarios)
             active_scenario_id.set(named_scenario.scenario_id)
             if pending_creates_scenario:
+                visible_scenario_ids.set((*visible_scenario_ids.get(), named_scenario.scenario_id))
                 next_scenario_number += 1
             pending_creates_scenario = False
             pending_scenario_id = None
@@ -1448,8 +1472,14 @@ def server(runtime, input: Inputs, output: Outputs, session: Session) -> None:
         scenarios = dict(scenarios_state.get())
         deleted = scenarios.pop(scenario_id, None)
         scenarios_state.set(scenarios)
-        active_scenario_id.set(None)
-        comparison_scenario_id.set(None)
+        active_scenario_id.set(next(iter(scenarios), None))
+        visible_scenario_ids.set(
+            tuple(
+                visible_id for visible_id in visible_scenario_ids.get() if visible_id != scenario_id
+            )
+        )
+        if not scenarios:
+            show_intervals_state.set(False)
         if deleted is not None:
             ui.notification_show(f'"{deleted.name}" deleted.', type="message", duration=4)
 

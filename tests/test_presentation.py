@@ -145,36 +145,67 @@ def test_chart_uses_percentage_point_changes_for_rate_series(
     assert plot_units(spec, "mom_annualized") == "Annualized percentage-point change"
 
 
-def test_scenario_chart_uses_high_contrast_color(synthetic_levels, fitted_model) -> None:
+def test_four_scenarios_use_distinct_colors_and_optional_intervals(
+    synthetic_levels, fitted_model
+) -> None:
     model = fitted_model
     baseline = model.forecast(horizon=12, draws=20, seed=3)
+    scenarios = tuple(
+        (name, baseline, index)
+        for index, name in enumerate(("Soft landing", "Oil shock", "Fiscal boost", "Credit event"))
+    )
 
     options = echarts_options(
         synthetic_levels,
         baseline,
         SERIES_SPECS[0],
-        scenario=baseline,
-        scenario_name="Soft landing",
-        comparison=baseline,
-        comparison_name="Oil shock",
+        scenarios,
+        show_intervals=False,
     )
     assert model.history_levels is not None
     table_html = forecast_gt(
         model.history_levels,
         baseline,
         SERIES_SPECS[:1],
-        scenario=baseline,
-        scenario_name="Soft landing",
-        comparison=baseline,
-        comparison_name="Oil shock",
+        scenarios,
+        show_intervals=False,
     ).as_raw_html()
 
-    assert options["series"][-2]["name"] == "Soft landing"
-    assert options["bvarBands"][-2]["name"].startswith("Soft landing")
-    assert options["bvarBands"][-1]["name"].startswith("Oil shock")
-    assert "Soft landing" in table_html
-    assert "Oil shock" in table_html
-    assert options["series"][-2]["lineStyle"]["color"] == "#ff8f5c"
-    assert options["series"][-1]["name"] == "Oil shock"
-    assert options["series"][-1]["lineStyle"]["color"] == "#a78bfa"
-    assert len(options["bvarBands"]) == 3
+    assert [series["name"] for series in options["series"][-4:]] == [
+        name for name, _forecast, _color in scenarios
+    ]
+    assert [series["lineStyle"]["color"] for series in options["series"][-4:]] == [
+        "#ff8f5c",
+        "#a78bfa",
+        "#fbbf24",
+        "#60a5fa",
+    ]
+    third_only = echarts_options(
+        synthetic_levels,
+        baseline,
+        SERIES_SPECS[0],
+        (scenarios[2],),
+        show_intervals=False,
+    )
+    assert third_only["series"][-1]["lineStyle"]["color"] == "#fbbf24"
+    assert options["bvarBands"] == []
+    assert 'class="forecast-interval"' not in table_html
+    for name, _forecast, _color in scenarios:
+        assert name in table_html
+
+    options_with_intervals = echarts_options(
+        synthetic_levels,
+        baseline,
+        SERIES_SPECS[0],
+        scenarios,
+        show_intervals=True,
+    )
+    table_with_intervals = forecast_gt(
+        model.history_levels,
+        baseline,
+        SERIES_SPECS[:1],
+        scenarios,
+        show_intervals=True,
+    ).as_raw_html()
+    assert len(options_with_intervals["bvarBands"]) == 5
+    assert table_with_intervals.count('class="forecast-interval"') == 5 * 12
